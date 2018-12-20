@@ -1,5 +1,4 @@
-var //pinboard = require('pinboard'),
-    parser = require('sax2json'),
+var parser = require('sax2json'),
 	request = require('request'),
 	express = require('express'),
 	server = express.createServer();
@@ -50,8 +49,8 @@ server.get('*', function (req, res) {
           } else {
             parser.toJson(body, function (x, obj) {
               res.json(obj);
-            });            
-          }          
+            });
+          }
         }
     });
 });
