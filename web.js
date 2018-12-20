@@ -1,8 +1,10 @@
 var parser = require('sax2json'),
 	request = require('request'),
-	express = require('express');
+	express = require('express'),
+  http = require('http');
 
-var server = module.exports = express.createServer();
+var app = express();
+var server = http.createServer(app);
 
 server.all('*', function (req, res, next) {
   res.header('Access-Control-Allow-Origin', '*');
