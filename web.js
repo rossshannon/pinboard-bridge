@@ -6,15 +6,16 @@ var parser = require('sax2json'),
 var app = express();
 var server = http.createServer(app);
 
-app.use(function (req, res, next) {
-  res.header('Access-Control-Allow-Origin', '*');
+app.all('*', function (req, res, next) {
+  var origin = req.get('origin');
+  res.header('Access-Control-Allow-Origin', origin);
   res.header('Access-Control-Allow-Headers', 'Content-Type, X-Requested-With, X-HTTP-Method-Override, Origin, Accept, Authorization');
   res.header('Access-Control-Allow-Credentials', 'true');
   res.header('Access-Control-Allow-Method', 'GET');
   next();
 });
 
-server.get('*', function (req, res) {
+app.get('*', function (req, res) {
     var header = req.headers['authorization'] || '',    // get the header
 	    token = header.split(/\s+/).pop() || '',          // and the encoded auth token
 	    auth = new Buffer(token, 'base64').toString(),    // convert from base64
