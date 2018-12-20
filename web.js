@@ -1,7 +1,6 @@
 var parser = require('sax2json'),
 	request = require('request'),
-	express = require('express'),
-	server = express.createServer();
+	express = require('express');
 
 var server = module.exports = express.createServer();
 
