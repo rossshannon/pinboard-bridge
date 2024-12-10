@@ -1,62 +1,75 @@
-var parser = require('sax2json'),
-	request = require('request'),
-	express = require('express'),
-  http = require('http');
+const parser = require('sax2json');
+const request = require('request');
+const express = require('express');
+const http = require('http');
 
-var app = express();
-var server = http.createServer(app);
+const app = express();
+const server = http.createServer(app);
 
-app.all('*', function (req, res, next) {
-  var origin = req.get('origin');
+// CORS middleware
+app.all('*', (req, res, next) => {
+  const origin = req.get('origin');
   res.header('Access-Control-Allow-Origin', origin);
   res.header('Access-Control-Allow-Headers', 'Content-Type, X-Requested-With, X-HTTP-Method-Override, Origin, Accept, Authorization');
   res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Allow-Method', 'GET');
+  res.header('Access-Control-Allow-Methods', 'GET');
   next();
 });
 
-app.get('*', function (req, res) {
-    var header = req.headers['authorization'] || '',    // get the header
-	    token = header.split(/\s+/).pop() || '',          // and the encoded auth token
-	    auth = new Buffer(token, 'base64').toString(),    // convert from base64
-	    parts = auth.split(/:/),                          // split on colon
-	    username = parts[0],
-	    password = parts[1],
-      newApi = req.query['auth_token'];
+app.get('*', (req, res) => {
+  try {
+    const header = req.headers['authorization'] || '';
+    const token = header.split(/\s+/).pop() || '';
+    const auth = Buffer.from(token, 'base64').toString();
+    const parts = auth.split(/:/);
+    const username = parts[0];
+    const password = parts[1];
+    const newApi = req.query['auth_token'];
 
     if ((!username || !password) && !newApi) {
-        res.json({ error: 'Not Authorized' });
-        return;
-    } else if (!newApi) {
-        username = username + ':' + password + '@'
+      return res.status(401).json({ error: 'Not Authorized' });
     }
 
-    var url = 'https://' + username + 'api.pinboard.in/v1' + req.path + '?';
+    const baseUrl = 'https://api.pinboard.in/v1';
+    let url = `${baseUrl}${req.path}?`;
 
-    var query = req.query;
-
-    for (var key in query) {
-        if (!Object.prototype.hasOwnProperty.call(query, key)) {
-            continue;
-        }
-        url = url + key + '=' + encodeURIComponent(query[key]) + '&';
+    if (!newApi) {
+      url = url.replace('https://', `https://${username}:${password}@`);
     }
 
-    request({
-        url: url
-    }, function (error, response, body) {
-        if (response.statusCode !== 200) {
-          res.send(body, response.statusCode);
-        } else {
-          if (req.query['format'] === 'json') {
-              res.json(JSON.parse(body));
-          } else {
-            parser.toJson(body, function (x, obj) {
-              res.json(obj);
-            });
-          }
+    const query = new URLSearchParams(req.query).toString();
+    url += query;
+
+    request({ url }, (error, response, body) => {
+      if (error) {
+        return res.status(500).json({ error: 'Failed to fetch from Pinboard API' });
+      }
+
+      if (response.statusCode !== 200) {
+        return res.status(response.statusCode).send(body);
+      }
+
+      if (req.query['format'] === 'json') {
+        try {
+          return res.json(JSON.parse(body));
+        } catch (e) {
+          return res.status(500).json({ error: 'Failed to parse JSON response' });
         }
+      }
+
+      parser.toJson(body, (err, obj) => {
+        if (err) {
+          return res.status(500).json({ error: 'Failed to parse XML response' });
+        }
+        res.json(obj);
+      });
     });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-server.listen(process.env.PORT || 1337);
+const PORT = process.env.PORT || 1337;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
