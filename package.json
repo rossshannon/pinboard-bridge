@@ -1,14 +1,14 @@
 {
     "private": "true",
 	"name": "pinboard-bridge",
-	"version": "1.1.0",
+	"version": "1.1.1",
 	"dependencies": {
-		"sax2json": "*",
-		"request": ">=2.0.0",
-		"express": "^4.9.8"
+		"axios": "^1.6.2",
+		"express": "^4.18.2",
+		"sax2json": "0.0.2"
 	},
     "engines": {
-      "node": "10.x",
-      "npm":  "3.10.10"
+      "node": ">=18.0.0",
+      "npm": ">=8.0.0"
     }
 }

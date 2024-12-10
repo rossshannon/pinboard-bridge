@@ -1,5 +1,5 @@
 const parser = require('sax2json');
-const request = require('request');
+const axios = require('axios');
 const express = require('express');
 const http = require('http');
 
@@ -16,7 +16,7 @@ app.all('*', (req, res, next) => {
   next();
 });
 
-app.get('*', (req, res) => {
+app.get('*', async (req, res) => {
   try {
     const header = req.headers['authorization'] || '';
     const token = header.split(/\s+/).pop() || '';
@@ -33,38 +33,38 @@ app.get('*', (req, res) => {
     const baseUrl = 'https://api.pinboard.in/v1';
     let url = `${baseUrl}${req.path}?`;
 
+    const axiosConfig = {};
     if (!newApi) {
-      url = url.replace('https://', `https://${username}:${password}@`);
+      axiosConfig.auth = {
+        username,
+        password
+      };
     }
 
     const query = new URLSearchParams(req.query).toString();
     url += query;
 
-    request({ url }, (error, response, body) => {
-      if (error) {
-        return res.status(500).json({ error: 'Failed to fetch from Pinboard API' });
-      }
+    const response = await axios.get(url, axiosConfig);
+    const { data, status } = response;
 
-      if (response.statusCode !== 200) {
-        return res.status(response.statusCode).send(body);
-      }
+    if (status !== 200) {
+      return res.status(status).send(data);
+    }
 
-      if (req.query['format'] === 'json') {
-        try {
-          return res.json(JSON.parse(body));
-        } catch (e) {
-          return res.status(500).json({ error: 'Failed to parse JSON response' });
-        }
-      }
+    if (req.query['format'] === 'json') {
+      return res.json(data);
+    }
 
-      parser.toJson(body, (err, obj) => {
-        if (err) {
-          return res.status(500).json({ error: 'Failed to parse XML response' });
-        }
-        res.json(obj);
-      });
+    parser.toJson(data, (err, obj) => {
+      if (err) {
+        return res.status(500).json({ error: 'Failed to parse XML response' });
+      }
+      res.json(obj);
     });
   } catch (error) {
+    if (error.response) {
+      return res.status(error.response.status).json({ error: error.response.data });
+    }
     res.status(500).json({ error: 'Internal server error' });
   }
 });
