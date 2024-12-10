@@ -1,0 +1,4 @@
+setup:
+  config:
+    NODE_ENV: production
+stack: heroku-22
