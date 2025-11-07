@@ -1,7 +1,7 @@
 {
     "private": "true",
 	"name": "pinboard-bridge",
-	"version": "1.1.1",
+	"version": "1.2.0",
 	"description": "Pinboard API proxy service",
 	"main": "web.js",
 	"scripts": {
@@ -9,9 +9,13 @@
 		"dev": "node web.js"
 	},
 	"dependencies": {
-		"axios": "^1.6.2",
-		"express": "^4.18.2",
-		"sax2json": "0.0.2"
+		"axios": "^1.13.2",
+		"cors": "^2.8.5",
+		"express": "^4.21.2",
+		"express-rate-limit": "^7.4.0",
+		"fast-xml-parser": "^4.5.0",
+		"helmet": "^8.0.0",
+		"morgan": "^1.10.0"
 	},
     "engines": {
       "node": ">=18.0.0",
