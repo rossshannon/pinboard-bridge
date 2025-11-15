@@ -4,7 +4,6 @@ const express = require('express');
 const http = require('http');
 const helmet = require('helmet');
 const cors = require('cors');
-const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 
 // Environment variable validation
@@ -30,9 +29,6 @@ app.use(helmet({
   contentSecurityPolicy: false, // Not needed for API
   crossOriginEmbedderPolicy: false,
 }));
-
-// Logging
-app.use(morgan(NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 // Rate limiting - 100 requests per 15 minutes per IP
 const limiter = rateLimit({
@@ -68,6 +64,16 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
+// Surface CORS rejections as JSON 403 errors
+app.use((err, req, res, next) => {
+  if (err.message === 'Not allowed by CORS') {
+    return res.status(403).json({ error: 'Origin not allowed by CORS policy' });
+  }
+
+  console.error('Middleware error:', err.message);
+  return res.status(500).json({ error: 'Internal server error' });
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({
@@ -91,36 +97,48 @@ const axiosConfig = {
 // Main proxy handler
 app.get('/v1/*', async (req, res) => {
   try {
-    // Extract authentication
-    const header = req.headers['authorization'] || '';
-    const token = header.split(/\s+/).pop() || '';
-    const auth = Buffer.from(token, 'base64').toString();
-    const parts = auth.split(/:/);
-    const username = parts[0];
-    const password = parts[1];
-    const newApi = req.query['auth_token'];
+    const authHeader = req.get('authorization') || '';
+    const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+    const basicMatch = authHeader.match(/^Basic\s+(.+)$/i);
 
-    if ((!username || !password) && !newApi) {
-      return res.status(401).json({ error: 'Not Authorized' });
+    let requestConfig = { ...axiosConfig };
+    const queryParams = new URLSearchParams(req.query);
+    queryParams.delete('auth_token');
+
+    if (basicMatch) {
+      const encoded = basicMatch[1];
+      const decoded = Buffer.from(encoded, 'base64').toString();
+      const [username, password] = decoded.split(/:/);
+
+      if (!username || !password) {
+        return res.status(401).json({ error: 'Invalid Basic authorization header' });
+      }
+
+      requestConfig = {
+        ...requestConfig,
+        auth: { username, password }
+      };
+    } else if (bearerMatch) {
+      const authToken = bearerMatch[1].trim();
+
+      if (!authToken.includes(':')) {
+        return res.status(401).json({ error: 'Invalid Bearer authorization header' });
+      }
+
+      queryParams.set('auth_token', authToken);
+    } else {
+      return res.status(401).json({ error: 'Authorization header required' });
     }
 
     // Build Pinboard API URL
     const baseUrl = 'https://api.pinboard.in';
     const path = req.path; // This includes /v1/...
-    let url = `${baseUrl}${path}?`;
+    let url = `${baseUrl}${path}`;
 
-    // Configure authentication
-    const requestConfig = { ...axiosConfig };
-    if (!newApi) {
-      requestConfig.auth = {
-        username,
-        password
-      };
+    const queryString = queryParams.toString();
+    if (queryString) {
+      url += `?${queryString}`;
     }
-
-    // Add query parameters
-    const query = new URLSearchParams(req.query).toString();
-    url += query;
 
     // Make request to Pinboard API
     const response = await axios.get(url, requestConfig);
