@@ -64,6 +64,9 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
+// Respond immediately to CORS preflight checks
+app.options('*', cors(corsOptions));
+
 // Surface CORS rejections as JSON 403 errors
 app.use((err, req, res, next) => {
   if (err.message === 'Not allowed by CORS') {
