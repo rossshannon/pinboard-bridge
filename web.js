@@ -241,6 +241,26 @@ const pickMetaValue = ($, selector, attributePreference = ['content', 'value', '
   return text && text.trim() ? text.trim() : null;
 };
 
+const FAVICON_SELECTORS = [
+  'link[rel="apple-touch-icon"]',
+  'link[rel="apple-touch-icon-precomposed"]',
+  'link[rel="icon"][type="image/png"]',
+  'link[rel="icon"][type="image/svg+xml"]',
+  'link[rel="mask-icon"]',
+  'link[rel="icon"]',
+  'link[rel="shortcut icon"]'
+];
+
+const selectFavicon = ($) => {
+  for (const selector of FAVICON_SELECTORS) {
+    const href = pickMetaValue($, selector, ['href']);
+    if (href) {
+      return href;
+    }
+  }
+  return null;
+};
+
 const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
   const $ = cheerio.load(html);
 
@@ -277,11 +297,7 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
     || pickMetaValue($, 'meta[name="msapplication-TileColor"]')
     || pickMetaValue($, 'meta[name="msapplication-navbutton-color"]');
 
-  const rawFavicon = pickMetaValue($, 'link[rel~="icon"]')
-    || pickMetaValue($, 'link[rel="shortcut icon"]')
-    || pickMetaValue($, 'link[rel="apple-touch-icon"]')
-    || pickMetaValue($, 'link[rel="mask-icon"]');
-
+  const rawFavicon = selectFavicon($);
   const faviconUrl = resolveAbsoluteUrl(canonicalUrl || finalUrl || originalUrl, rawFavicon);
 
   if (!title && !description && !imageUrl) {
