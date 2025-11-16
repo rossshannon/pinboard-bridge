@@ -12,6 +12,7 @@ A CORS-enabled proxy service for the Pinboard API with enhanced security feature
 - **Health Check Endpoint**: Monitor service status at `/health`
 - **Graceful Shutdown**: Proper handling of SIGTERM/SIGINT signals
 - **Error Handling**: Comprehensive error handling with consistent JSON responses
+- **Preview API**: Server-side endpoint that scrapes Twitter/Open Graph metadata alongside Pinboard suggestions
 
 ## Requirements
 
@@ -55,6 +56,7 @@ ALLOWED_ORIGINS=https://rossshannon.github.com
 
 - 100 requests per 15 minutes are allowed per source IP. Heroku users should ensure `app.set('trust proxy', 1)` remains enabled so the limiter sees client IPs.
 - When throttled, responses include standard `RateLimit-*` headers so the UI can surface “retry-after” information.
+- `/posts/suggest-with-preview` adds a per-token limiter (30 requests/minute) to prevent abusive preview scraping.
 
 ## Running Locally
 
@@ -85,8 +87,48 @@ curl \
 |--------|------|-------------|
 | `GET` | `/health` | Returns service status, uptime, and timestamp. Useful for uptime monitors. |
 | `GET` | `/v1/*` | Forwards requests to `https://api.pinboard.in` with the same path/query, after injecting auth info and normalizing responses. |
+| `GET` | `/posts/suggest-with-preview` | Calls Pinboard’s `posts/suggest` and, in parallel, fetches preview metadata (Twitter Card/Open Graph) for the supplied URL. |
 
 Responses default to JSON. If Pinboard returns XML (the default), the bridge converts it to JSON via `fast-xml-parser` before sending the response back to the browser.
+
+### `/posts/suggest-with-preview`
+
+This endpoint keeps preview scraping on the server (no extra browser permissions) while returning the same suggestions data as Pinboard’s `posts/suggest`.
+
+**Query parameters**
+
+- `url` (required): The bookmark target. Must be `http://` or `https://` and cannot point to localhost/loopback/RFC1918 hosts.
+
+**Authentication**
+
+- Same `Authorization` header scheme as the other routes (Basic or Bearer, both using `username:token`). Incoming `auth_token` query params are ignored.
+
+**Response structure**
+
+```json
+{
+  "suggestions": { "popular": [], "recommended": [] },
+  "preview": {
+    "url": "https://example.com/article",
+    "title": "Amazing Gadget",
+    "description": "All the reasons it is amazing.",
+    "imageUrl": "https://example.com/images/gadget.png",
+    "siteName": "Example News",
+    "siteHandle": "@example",
+    "siteDomain": "example.com",
+    "cardType": "summary_large_image",
+    "fetchedAt": "2025-11-15T20:05:00.000Z"
+  },
+  "previewError": "optional explanation when preview scraping fails"
+}
+```
+
+`preview` is omitted (or `null`) when no metadata is found. If the metadata fetch fails entirely (timeout, unsupported MIME type, invalid URL, etc.), the endpoint still returns the Pinboard suggestions but adds a `previewError` string so the UI can display a warning.
+
+**Limits & logging**
+
+- Preview fetches are limited to 30 requests per minute per Authorization token.
+- Each request logs `{user, targetHost, outcome}` (`preview_generated`, `preview_not_found`, or `preview_failed`) to help spot misuse without storing the raw token.
 
 ## Deployment
 
@@ -127,6 +169,7 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - Helmet.js security headers
 - CORS origin validation with explicit 403 JSON responses for disallowed origins
 - Rate limiting per IP
+- Per-token preview throttling and structured preview logging
 - 30-second request timeout
 - Sanitized error messages without leaking upstream responses
 - Authorization headers only (tokens never logged in URLs)
@@ -140,6 +183,7 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - Return JSON 403 responses for blocked origins
 - Document recommended `ALLOWED_ORIGINS` value (`https://rossshannon.github.com`) and update `.env.example`
 - Bump dependencies to drop unused logging package
+- Add `/posts/suggest-with-preview` endpoint with URL validation, metadata parsing, and per-token throttling
 
 ### Version 1.2.0
 - Updated dependencies (axios, express)

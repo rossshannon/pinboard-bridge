@@ -1,9 +1,11 @@
 const { XMLParser } = require('fast-xml-parser');
 const axios = require('axios');
+const cheerio = require('cheerio');
 const express = require('express');
 const http = require('http');
 const helmet = require('helmet');
 const cors = require('cors');
+const net = require('net');
 const rateLimit = require('express-rate-limit');
 
 // Environment variable validation
@@ -12,6 +14,9 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
   : null; // null means allow all origins (for backward compatibility)
+const PINBOARD_BASE_URL = 'https://api.pinboard.in';
+const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+const PREVIEW_TIMEOUT_MS = 5000;
 
 // Log startup configuration
 console.log(`Starting Pinboard Bridge in ${NODE_ENV} mode`);
@@ -77,6 +82,238 @@ app.use((err, req, res, next) => {
   return res.status(500).json({ error: 'Internal server error' });
 });
 
+// XML parser configuration
+const xmlParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: '@_',
+});
+
+// Axios configuration with timeout
+const apiRequestDefaults = {
+  timeout: 30000, // 30 seconds timeout
+};
+
+const previewRequestConfig = {
+  timeout: PREVIEW_TIMEOUT_MS,
+  maxRedirects: 3,
+  maxContentLength: PREVIEW_MAX_BYTES,
+  maxBodyLength: PREVIEW_MAX_BYTES,
+  responseType: 'arraybuffer',
+  headers: {
+    Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
+    'User-Agent': 'pinboard-bridge/2.0 (+https://github.com/rossshannon/pinboard-bridge)'
+  },
+  validateStatus: status => status >= 200 && status < 400,
+};
+
+const buildSearchParams = query => {
+  const params = new URLSearchParams();
+  Object.entries(query || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null) {
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(item => params.append(key, item));
+    } else {
+      params.append(key, value);
+    }
+  });
+  return params;
+};
+
+const decodeBasicCredentials = encoded => {
+  const decoded = Buffer.from(encoded, 'base64').toString();
+  const separatorIndex = decoded.indexOf(':');
+  if (separatorIndex === -1) {
+    return { username: '', password: '' };
+  }
+  return {
+    username: decoded.slice(0, separatorIndex),
+    password: decoded.slice(separatorIndex + 1)
+  };
+};
+
+const applyAuthContext = (req, queryParams) => {
+  if (queryParams) {
+    queryParams.delete('auth_token');
+  }
+
+  const authHeader = req.get('authorization') || '';
+  const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  const basicMatch = authHeader.match(/^Basic\s+(.+)$/i);
+
+  if (basicMatch) {
+    const { username, password } = decodeBasicCredentials(basicMatch[1]);
+    if (!username || !password) {
+      throw new Error('Invalid Basic authorization header');
+    }
+    return {
+      requestConfig: {
+        ...apiRequestDefaults,
+        auth: { username, password }
+      },
+      identity: username
+    };
+  }
+
+  if (bearerMatch) {
+    const authToken = bearerMatch[1].trim();
+    if (!authToken.includes(':')) {
+      throw new Error('Invalid Bearer authorization header');
+    }
+    if (queryParams) {
+      queryParams.set('auth_token', authToken);
+    }
+    return {
+      requestConfig: { ...apiRequestDefaults },
+      identity: authToken.split(':')[0] || 'token'
+    };
+  }
+
+  throw new Error('Authorization header required');
+};
+
+const isPrivateHostname = hostname => {
+  if (!hostname) return true;
+  const lower = hostname.toLowerCase();
+  if (lower === 'localhost' || lower.endsWith('.localhost')) {
+    return true;
+  }
+
+  const ipVersion = net.isIP(hostname);
+  if (ipVersion === 4) {
+    const octets = hostname.split('.').map(Number);
+    if (octets[0] === 10) return true;
+    if (octets[0] === 127) return true;
+    if (octets[0] === 192 && octets[1] === 168) return true;
+    if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) return true;
+    if (octets[0] === 169 && octets[1] === 254) return true;
+  }
+
+  if (ipVersion === 6) {
+    const normalized = hostname.toLowerCase();
+    if (normalized === '::1') return true;
+    if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true;
+  }
+
+  return false;
+};
+
+const resolveAbsoluteUrl = (baseUrl, value) => {
+  if (!value) return null;
+  try {
+    return new URL(value, baseUrl).toString();
+  } catch (err) {
+    return null;
+  }
+};
+
+const deriveSiteDomain = urlString => {
+  try {
+    const parsed = new URL(urlString);
+    return parsed.hostname.replace(/^www\./i, '');
+  } catch (err) {
+    return null;
+  }
+};
+
+const pickMetaValue = ($, selector, attributePreference = ['content', 'value', 'href']) => {
+  const element = $(selector).first();
+  if (!element || element.length === 0) {
+    return null;
+  }
+
+  if (selector.toLowerCase().startsWith('meta')) {
+    for (const attr of attributePreference) {
+      const candidate = element.attr(attr);
+      if (candidate && candidate.trim()) {
+        return candidate.trim();
+      }
+    }
+  }
+
+  if (selector.toLowerCase().startsWith('link')) {
+    const href = element.attr('href');
+    return href && href.trim() ? href.trim() : null;
+  }
+
+  const text = element.text();
+  return text && text.trim() ? text.trim() : null;
+};
+
+const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
+  const $ = cheerio.load(html);
+
+  const title = pickMetaValue($, 'meta[name="twitter:title"]')
+    || pickMetaValue($, 'meta[property="og:title"]')
+    || pickMetaValue($, 'meta[name="title"]')
+    || pickMetaValue($, 'title');
+
+  const description = pickMetaValue($, 'meta[name="twitter:description"]')
+    || pickMetaValue($, 'meta[property="og:description"]')
+    || pickMetaValue($, 'meta[name="description"]');
+
+  const rawImage = pickMetaValue($, 'meta[name="twitter:image"]')
+    || pickMetaValue($, 'meta[name="twitter:image:src"]')
+    || pickMetaValue($, 'meta[property="og:image"]');
+
+  const siteName = pickMetaValue($, 'meta[property="og:site_name"]')
+    || pickMetaValue($, 'meta[name="application-name"]');
+
+  const siteHandle = pickMetaValue($, 'meta[name="twitter:site"]')
+    || pickMetaValue($, 'meta[name="twitter:creator"]');
+
+  const cardType = pickMetaValue($, 'meta[name="twitter:card"]');
+
+  const canonical = pickMetaValue($, 'link[rel="canonical"]')
+    || pickMetaValue($, 'meta[property="og:url"]')
+    || pickMetaValue($, 'meta[name="twitter:url"]');
+
+  const canonicalUrl = resolveAbsoluteUrl(finalUrl, canonical) || finalUrl || originalUrl;
+  const imageUrl = resolveAbsoluteUrl(canonicalUrl, rawImage);
+  const siteDomain = deriveSiteDomain(canonicalUrl || originalUrl);
+
+  if (!title && !description && !imageUrl) {
+    return null;
+  }
+
+  return {
+    url: canonicalUrl,
+    title: title || null,
+    description: description || null,
+    imageUrl: imageUrl || null,
+    siteName: siteName || null,
+    siteHandle: siteHandle || null,
+    siteDomain: siteDomain || null,
+    cardType: cardType || null,
+    fetchedAt: new Date().toISOString()
+  };
+};
+
+const fetchPreview = async targetUrl => {
+  const response = await axios.get(targetUrl.toString(), previewRequestConfig);
+  const finalUrl = response.request?.res?.responseUrl || targetUrl.toString();
+  const contentType = response.headers['content-type'] || '';
+  if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+    throw new Error('Preview response is not HTML');
+  }
+
+  const body = Buffer.isBuffer(response.data)
+    ? response.data.toString('utf8')
+    : response.data;
+
+  return extractPreviewMetadata(body, finalUrl, targetUrl.toString());
+};
+
+const previewRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many preview requests, please slow down.' },
+  keyGenerator: req => req.headers['authorization'] || req.ip,
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({
@@ -86,57 +323,104 @@ app.get('/health', (req, res) => {
   });
 });
 
-// XML parser configuration
-const xmlParser = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: '@_',
-});
+// Suggest with preview endpoint
+app.get('/posts/suggest-with-preview', previewRateLimiter, async (req, res) => {
+  try {
+    const target = Array.isArray(req.query.url) ? req.query.url[0] : req.query.url;
+    if (!target) {
+      return res.status(400).json({ error: 'url query parameter is required' });
+    }
 
-// Axios configuration with timeout
-const axiosConfig = {
-  timeout: 30000, // 30 seconds timeout
-};
+    let normalizedUrl;
+    try {
+      normalizedUrl = new URL(target);
+    } catch (err) {
+      return res.status(400).json({ error: 'Invalid url parameter' });
+    }
+
+    if (!['http:', 'https:'].includes(normalizedUrl.protocol)) {
+      return res.status(400).json({ error: 'URL must use http or https' });
+    }
+
+    if (isPrivateHostname(normalizedUrl.hostname)) {
+      return res.status(400).json({ error: 'URL host is not reachable from the proxy' });
+    }
+
+    const pinboardParams = new URLSearchParams();
+    pinboardParams.set('url', normalizedUrl.toString());
+    pinboardParams.set('format', 'json');
+
+    let authContext;
+    try {
+      authContext = applyAuthContext(req, pinboardParams);
+    } catch (err) {
+      return res.status(401).json({ error: err.message });
+    }
+
+    const pinboardUrl = `${PINBOARD_BASE_URL}/v1/posts/suggest?${pinboardParams.toString()}`;
+    const suggestionsPromise = axios.get(pinboardUrl, authContext.requestConfig);
+    const previewPromise = fetchPreview(normalizedUrl);
+
+    const [suggestionsResult, previewResult] = await Promise.allSettled([suggestionsPromise, previewPromise]);
+
+    if (suggestionsResult.status === 'rejected') {
+      const error = suggestionsResult.reason;
+      if (error.response) {
+        const status = error.response.status;
+        const message = typeof error.response.data === 'string'
+          ? error.response.data
+          : error.response.data?.error || 'API request failed';
+        return res.status(status).json({ error: message });
+      }
+
+      if (error.code === 'ECONNABORTED') {
+        return res.status(504).json({ error: 'Gateway timeout' });
+      }
+
+      console.error('Pinboard suggest error:', error.message);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+
+    let preview = null;
+    let previewError = null;
+    if (previewResult.status === 'fulfilled') {
+      preview = previewResult.value;
+    } else {
+      previewError = previewResult.reason?.message || 'Failed to fetch preview metadata';
+    }
+
+    const payload = {
+      suggestions: suggestionsResult.value.data,
+      preview
+    };
+
+    if (previewError) {
+      payload.previewError = previewError;
+    }
+
+    const outcome = preview ? 'preview_generated' : (previewError ? 'preview_failed' : 'preview_not_found');
+    console.info(`[preview] user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${outcome}` + (previewError ? ` message="${previewError}"` : ''));
+
+    return res.json(payload);
+  } catch (error) {
+    console.error('Suggest preview handler error:', error.message);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // Main proxy handler
 app.get('/v1/*', async (req, res) => {
   try {
-    const authHeader = req.get('authorization') || '';
-    const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
-    const basicMatch = authHeader.match(/^Basic\s+(.+)$/i);
-
-    let requestConfig = { ...axiosConfig };
-    const queryParams = new URLSearchParams(req.query);
-    queryParams.delete('auth_token');
-
-    if (basicMatch) {
-      const encoded = basicMatch[1];
-      const decoded = Buffer.from(encoded, 'base64').toString();
-      const [username, password] = decoded.split(/:/);
-
-      if (!username || !password) {
-        return res.status(401).json({ error: 'Invalid Basic authorization header' });
-      }
-
-      requestConfig = {
-        ...requestConfig,
-        auth: { username, password }
-      };
-    } else if (bearerMatch) {
-      const authToken = bearerMatch[1].trim();
-
-      if (!authToken.includes(':')) {
-        return res.status(401).json({ error: 'Invalid Bearer authorization header' });
-      }
-
-      queryParams.set('auth_token', authToken);
-    } else {
-      return res.status(401).json({ error: 'Authorization header required' });
+    const queryParams = buildSearchParams(req.query);
+    let authContext;
+    try {
+      authContext = applyAuthContext(req, queryParams);
+    } catch (err) {
+      return res.status(401).json({ error: err.message });
     }
 
-    // Build Pinboard API URL
-    const baseUrl = 'https://api.pinboard.in';
     const path = req.path; // This includes /v1/...
-    let url = `${baseUrl}${path}`;
+    let url = `${PINBOARD_BASE_URL}${path}`;
 
     const queryString = queryParams.toString();
     if (queryString) {
@@ -144,7 +428,7 @@ app.get('/v1/*', async (req, res) => {
     }
 
     // Make request to Pinboard API
-    const response = await axios.get(url, requestConfig);
+    const response = await axios.get(url, authContext.requestConfig);
     const { data, status } = response;
 
     if (status !== 200) {
