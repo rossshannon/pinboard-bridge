@@ -273,6 +273,17 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
   const imageUrl = resolveAbsoluteUrl(canonicalUrl, rawImage);
   const siteDomain = deriveSiteDomain(canonicalUrl || originalUrl);
 
+  const themeColor = pickMetaValue($, 'meta[name="theme-color"]')
+    || pickMetaValue($, 'meta[name="msapplication-TileColor"]')
+    || pickMetaValue($, 'meta[name="msapplication-navbutton-color"]');
+
+  const rawFavicon = pickMetaValue($, 'link[rel~="icon"]')
+    || pickMetaValue($, 'link[rel="shortcut icon"]')
+    || pickMetaValue($, 'link[rel="apple-touch-icon"]')
+    || pickMetaValue($, 'link[rel="mask-icon"]');
+
+  const faviconUrl = resolveAbsoluteUrl(canonicalUrl || finalUrl || originalUrl, rawFavicon);
+
   if (!title && !description && !imageUrl) {
     return null;
   }
@@ -286,7 +297,10 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
     siteHandle: siteHandle || null,
     siteDomain: siteDomain || null,
     cardType: cardType || null,
-    fetchedAt: new Date().toISOString()
+    themeColor: themeColor || null,
+    faviconUrl: faviconUrl || null,
+    fetchedAt: new Date().toISOString(),
+    status: 'fresh'
   };
 };
 
@@ -383,15 +397,19 @@ app.get('/posts/suggest-with-preview', previewRateLimiter, async (req, res) => {
 
     let preview = null;
     let previewError = null;
+    let previewStatus = 'none';
     if (previewResult.status === 'fulfilled') {
       preview = previewResult.value;
+      previewStatus = preview ? (preview.status || 'fresh') : 'no_data';
     } else {
       previewError = previewResult.reason?.message || 'Failed to fetch preview metadata';
+      previewStatus = 'error';
     }
 
     const payload = {
       suggestions: suggestionsResult.value.data,
-      preview
+      preview,
+      previewStatus
     };
 
     if (previewError) {

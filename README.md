@@ -13,6 +13,7 @@ A CORS-enabled proxy service for the Pinboard API with enhanced security feature
 - **Graceful Shutdown**: Proper handling of SIGTERM/SIGINT signals
 - **Error Handling**: Comprehensive error handling with consistent JSON responses
 - **Preview API**: Server-side endpoint that scrapes Twitter/Open Graph metadata alongside Pinboard suggestions
+- **Preview API**: Server-side endpoint that scrapes Twitter/Open Graph metadata alongside Pinboard suggestions
 
 ## Requirements
 
@@ -117,13 +118,16 @@ This endpoint keeps preview scraping on the server (no extra browser permissions
     "siteHandle": "@example",
     "siteDomain": "example.com",
     "cardType": "summary_large_image",
+    "themeColor": "#0a84ff",
+    "faviconUrl": "https://example.com/favicon.ico",
     "fetchedAt": "2025-11-15T20:05:00.000Z"
   },
+  "previewStatus": "fresh",
   "previewError": "optional explanation when preview scraping fails"
 }
 ```
 
-`preview` is omitted (or `null`) when no metadata is found. If the metadata fetch fails entirely (timeout, unsupported MIME type, invalid URL, etc.), the endpoint still returns the Pinboard suggestions but adds a `previewError` string so the UI can display a warning.
+`preview` is omitted (or `null`) when no metadata is found. If the metadata fetch fails entirely (timeout, unsupported MIME type, invalid URL, etc.), the endpoint still returns the Pinboard suggestions but adds a `previewError` string and sets `previewStatus` to `error`. When data is returned straight from a fresh fetch, `previewStatus` is `fresh` (future updates may re-use this flag to signal cached responses).
 
 **Limits & logging**
 
@@ -184,6 +188,7 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - Document recommended `ALLOWED_ORIGINS` value (`https://rossshannon.github.com`) and update `.env.example`
 - Bump dependencies to drop unused logging package
 - Add `/posts/suggest-with-preview` endpoint with URL validation, metadata parsing, and per-token throttling
+- Include `themeColor`, `faviconUrl`, and `previewStatus` so the frontend can style cards and detect stale previews
 
 ### Version 1.2.0
 - Updated dependencies (axios, express)
