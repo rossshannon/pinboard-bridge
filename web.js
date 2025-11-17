@@ -241,6 +241,16 @@ const pickMetaValue = ($, selector, attributePreference = ['content', 'value', '
   return text && text.trim() ? text.trim() : null;
 };
 
+const pickMetaValueWithSource = ($, selectors) => {
+  for (const selector of selectors) {
+    const value = pickMetaValue($, selector);
+    if (value) {
+      return { value, source: selector };
+    }
+  }
+  return { value: null, source: null };
+};
+
 const FAVICON_SELECTORS = [
   'link[rel="apple-touch-icon"]',
   'link[rel="apple-touch-icon-precomposed"]',
@@ -280,8 +290,19 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
   const siteName = pickMetaValue($, 'meta[property="og:site_name"]')
     || pickMetaValue($, 'meta[name="application-name"]');
 
-  const siteHandle = pickMetaValue($, 'meta[name="twitter:site"]')
-    || pickMetaValue($, 'meta[name="twitter:creator"]');
+  const siteHandleCandidate = pickMetaValueWithSource($, [
+    'meta[name="twitter:site"]',
+    'meta[name="twitter:creator"]'
+  ]);
+  const siteHandle = siteHandleCandidate.value;
+
+  let siteHandleUrl = null;
+  if (siteHandle && siteHandleCandidate.source?.includes('twitter')) {
+    const normalizedHandle = siteHandle.replace(/^@/, '').trim();
+    if (normalizedHandle) {
+      siteHandleUrl = `https://twitter.com/${normalizedHandle}`;
+    }
+  }
 
   const cardType = pickMetaValue($, 'meta[name="twitter:card"]');
 
@@ -311,6 +332,7 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
     imageUrl: imageUrl || null,
     siteName: siteName || null,
     siteHandle: siteHandle || null,
+    siteHandleUrl,
     siteDomain: siteDomain || null,
     cardType: cardType || null,
     themeColor: themeColor || null,

@@ -116,6 +116,7 @@ This endpoint keeps preview scraping on the server (no extra browser permissions
     "imageUrl": "https://example.com/images/gadget.png",
     "siteName": "Example News",
     "siteHandle": "@example",
+    "siteHandleUrl": "https://twitter.com/example",
     "siteDomain": "example.com",
     "cardType": "summary_large_image",
     "themeColor": "#0a84ff",
@@ -127,7 +128,7 @@ This endpoint keeps preview scraping on the server (no extra browser permissions
 }
 ```
 
-`preview` is omitted (or `null`) when no metadata is found. If the metadata fetch fails entirely (timeout, unsupported MIME type, invalid URL, etc.), the endpoint still returns the Pinboard suggestions but adds a `previewError` string and sets `previewStatus` to `error`. When data is returned straight from a fresh fetch, `previewStatus` is `fresh` (future updates may re-use this flag to signal cached responses).
+`preview` is omitted (or `null`) when no metadata is found. If the metadata fetch fails entirely (timeout, unsupported MIME type, invalid URL, etc.), the endpoint still returns the Pinboard suggestions but adds a `previewError` string and sets `previewStatus` to `error`. When data is returned straight from a fresh fetch, `previewStatus` is `fresh` (future updates may re-use this flag to signal cached responses). Whenever the site exposes a Twitter creator/site tag, the payload also includes `siteHandleUrl` so UIs can link to the social profile directly.
 
 **Limits & logging**
 
