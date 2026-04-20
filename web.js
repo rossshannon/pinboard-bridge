@@ -357,9 +357,12 @@ const fetchPreview = async targetUrl => {
   return extractPreviewMetadata(body, finalUrl, targetUrl.toString());
 };
 
+// Pinboard's published policy is one call per user per 3 seconds, so 20/min
+// is the maximum sustained rate their /posts/suggest endpoint will accept
+// before rate-limiting drops requests (observed as silent TCP hang-ups).
 const previewRateLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 30,
+  max: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many preview requests, please slow down.' },
