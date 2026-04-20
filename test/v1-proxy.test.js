@@ -212,6 +212,19 @@ test('returns 500 on upstream network error without HTTP response', async () => 
   assert.equal(res.status, 500);
 });
 
+test('forwards repeated query params (array values) as repeated keys to Pinboard', async () => {
+  mocks.upstream = { kind: 'success', data: { posts: [] }, headers: { 'content-type': 'application/json' } };
+
+  // Express parses ?tag=web&tag=dev into an array. buildSearchParams must
+  // emit both values, not drop one or JSON-encode the array.
+  await call('/v1/posts/get?tag=web&tag=dev&format=json');
+
+  const sent = capturedRequests[0];
+  const params = new URL(sent.url).searchParams;
+  const tags = params.getAll('tag');
+  assert.deepEqual(tags.sort(), ['dev', 'web']);
+});
+
 test('returns 500 when upstream XML is malformed', async () => {
   mocks.upstream = {
     kind: 'success',

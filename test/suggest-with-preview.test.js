@@ -86,6 +86,9 @@ axios.defaults.adapter = async (config) => {
 };
 
 process.env.PORT = '0';
+// This suite issues ~20 requests with a shared Authorization header; the
+// production-safe 20/min preview limit would 429 the bulk of them.
+process.env.PREVIEW_RATE_LIMIT_MAX = '10000';
 
 const { server } = require('../web.js');
 
@@ -119,6 +122,13 @@ const successfulPreview = () => ({
   data: Buffer.from(PREVIEW_HTML, 'utf8'),
   headers: { 'content-type': 'text/html; charset=utf-8' },
   responseUrl: TARGET_URL
+});
+
+const previewFromHtml = (html, responseUrl = TARGET_URL) => ({
+  kind: 'success',
+  data: Buffer.from(html, 'utf8'),
+  headers: { 'content-type': 'text/html; charset=utf-8' },
+  responseUrl
 });
 
 const successfulSuggestions = () => ({
@@ -259,6 +269,64 @@ test('rejects private-network URL (SSRF guard)', async () => {
   assert.match(body.error, /not reachable/i);
 });
 
+// Exercising every private range the SSRF guard claims to block. The handler
+// must refuse before any upstream call, so we deliberately leave the mocks
+// unconfigured — if the guard slips, the adapter throws "No mock configured".
+for (const host of [
+  '10.0.0.1',
+  '192.168.1.1',
+  '172.16.5.5',
+  '172.31.255.1',
+  '169.254.169.254', // AWS/GCE metadata endpoint — classic SSRF target
+  'localhost',
+  'foo.localhost',
+  '[::1]',
+  '[fc00::1]',
+  '[fd12:3456:789a::1]'
+]) {
+  test(`rejects private host ${host} without contacting upstream`, async () => {
+    const res = await call(`/posts/suggest-with-preview?url=${encodeURIComponent(`http://${host}/x`)}`);
+    const body = await res.json();
+
+    assert.equal(res.status, 400, `expected 400 for ${host}, got ${res.status}`);
+    assert.match(body.error, /not reachable/i);
+    assert.equal(capturedRequests.length, 0, `upstream must not be called for ${host}`);
+  });
+}
+
+test('allows public IPv4 addresses through the SSRF guard', async () => {
+  mocks.pinboard = successfulSuggestions();
+  mocks.preview = {
+    kind: 'success',
+    data: Buffer.from(PREVIEW_HTML, 'utf8'),
+    headers: { 'content-type': 'text/html; charset=utf-8' },
+    responseUrl: 'http://8.8.8.8/x'
+  };
+
+  const res = await call(`/posts/suggest-with-preview?url=${encodeURIComponent('http://8.8.8.8/x')}`);
+  assert.equal(res.status, 200);
+});
+
+test('rejects preview response when upstream content-type is not HTML', async () => {
+  mocks.pinboard = successfulSuggestions();
+  mocks.preview = {
+    kind: 'success',
+    data: Buffer.from('%PDF-1.4 ...', 'utf8'),
+    headers: { 'content-type': 'application/pdf' },
+    responseUrl: TARGET_URL
+  };
+
+  const res = await call(requestUrl());
+  const body = await res.json();
+
+  // Suggestions still succeed; preview should cleanly fail without crashing.
+  assert.equal(res.status, 200);
+  assert.equal(body.suggestionsStatus, 'ok');
+  assert.equal(body.preview, null);
+  assert.equal(body.previewStatus, 'error');
+  assert.match(body.previewError, /not HTML/i);
+});
+
 test('sends an identifying User-Agent on outbound Pinboard requests', async () => {
   mocks.pinboard = successfulSuggestions();
   mocks.preview = successfulPreview();
@@ -270,4 +338,149 @@ test('sends an identifying User-Agent on outbound Pinboard requests', async () =
   assert.ok(pinboardCall, 'expected an outbound call to api.pinboard.in');
   assert.ok(pinboardCall.userAgent, 'User-Agent header should be set');
   assert.match(pinboardCall.userAgent, /pinboard-bridge/i);
+});
+
+// --- Metadata precedence -----------------------------------------------------
+// extractPreviewMetadata reads a cascade: twitter:* → og:* → <meta name=…> →
+// <title>. These tests pin the priority order so a future refactor can't
+// silently swap the winners.
+
+const fetchPreview = async (html, { responseUrl } = {}) => {
+  mocks.pinboard = successfulSuggestions();
+  mocks.preview = previewFromHtml(html, responseUrl || TARGET_URL);
+  const res = await call(requestUrl());
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  return body.preview;
+};
+
+test('twitter:title beats og:title beats <title>', async () => {
+  const preview = await fetchPreview([
+    '<html><head>',
+    '<title>Plain title</title>',
+    '<meta property="og:title" content="OG title">',
+    '<meta name="twitter:title" content="Twitter title">',
+    '<meta property="og:image" content="https://example.com/og.png">',
+    '</head></html>'
+  ].join(''));
+  assert.equal(preview.title, 'Twitter title');
+});
+
+test('og:title wins when twitter:title is absent', async () => {
+  const preview = await fetchPreview([
+    '<html><head>',
+    '<title>Plain title</title>',
+    '<meta property="og:title" content="OG title">',
+    '<meta property="og:image" content="https://example.com/og.png">',
+    '</head></html>'
+  ].join(''));
+  assert.equal(preview.title, 'OG title');
+});
+
+test('<title> is used when no og or twitter tags are present', async () => {
+  const preview = await fetchPreview([
+    '<html><head>',
+    '<title>Plain title</title>',
+    '<meta name="description" content="desc">',
+    '</head></html>'
+  ].join(''));
+  assert.equal(preview.title, 'Plain title');
+});
+
+test('description falls back from twitter to og to <meta name="description">', async () => {
+  const preview = await fetchPreview([
+    '<html><head>',
+    '<title>t</title>',
+    '<meta name="description" content="plain desc">',
+    '<meta property="og:description" content="og desc">',
+    '</head></html>'
+  ].join(''));
+  assert.equal(preview.description, 'og desc');
+});
+
+test('theme-color falls back to msapplication-TileColor when theme-color is absent', async () => {
+  const preview = await fetchPreview([
+    '<html><head>',
+    '<title>t</title>',
+    '<meta name="description" content="d">',
+    '<meta name="msapplication-TileColor" content="#112233">',
+    '</head></html>'
+  ].join(''));
+  assert.equal(preview.themeColor, '#112233');
+});
+
+test('canonical URL is taken from og:url when no <link rel="canonical">', async () => {
+  const preview = await fetchPreview([
+    '<html><head>',
+    '<title>t</title>',
+    '<meta name="description" content="d">',
+    '<meta property="og:url" content="https://example.com/canonical">',
+    '</head></html>'
+  ].join(''));
+  assert.equal(preview.url, 'https://example.com/canonical');
+});
+
+test('siteHandleUrl is built from twitter:site handle', async () => {
+  const preview = await fetchPreview([
+    '<html><head>',
+    '<title>t</title>',
+    '<meta name="description" content="d">',
+    '<meta name="twitter:site" content="@examplehandle">',
+    '</head></html>'
+  ].join(''));
+  assert.equal(preview.siteHandle, '@examplehandle');
+  assert.equal(preview.siteHandleUrl, 'https://twitter.com/examplehandle');
+});
+
+// --- Favicon fallback chain --------------------------------------------------
+// FAVICON_SELECTORS walks apple-touch-icon → icon[png] → icon[svg] →
+// mask-icon → icon → shortcut icon. We verify the tail of the chain since the
+// happy path is implicitly covered by tests that include a <link rel=icon>.
+
+test('falls back to <link rel="shortcut icon"> when no higher-priority favicon selectors match', async () => {
+  const preview = await fetchPreview([
+    '<html><head>',
+    '<title>t</title>',
+    '<meta name="description" content="d">',
+    '<link rel="shortcut icon" href="/favicon.ico">',
+    '</head></html>'
+  ].join(''));
+  assert.equal(preview.faviconUrl, 'https://example.com/favicon.ico');
+});
+
+test('apple-touch-icon takes precedence over plain <link rel="icon">', async () => {
+  const preview = await fetchPreview([
+    '<html><head>',
+    '<title>t</title>',
+    '<meta name="description" content="d">',
+    '<link rel="icon" href="/fallback.ico">',
+    '<link rel="apple-touch-icon" href="/apple.png">',
+    '</head></html>'
+  ].join(''));
+  assert.equal(preview.faviconUrl, 'https://example.com/apple.png');
+});
+
+test('faviconUrl is null when no favicon-carrying <link> is present', async () => {
+  const preview = await fetchPreview([
+    '<html><head>',
+    '<title>t</title>',
+    '<meta name="description" content="d">',
+    '</head></html>'
+  ].join(''));
+  assert.equal(preview.faviconUrl, null);
+});
+
+// --- No-data short-circuit ---------------------------------------------------
+
+test('returns previewStatus "no_data" when HTML has no title/description/image', async () => {
+  mocks.pinboard = successfulSuggestions();
+  mocks.preview = previewFromHtml('<html><head></head><body>Just body text</body></html>');
+
+  const res = await call(requestUrl());
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.suggestionsStatus, 'ok');
+  assert.equal(body.preview, null);
+  assert.equal(body.previewStatus, 'no_data');
 });

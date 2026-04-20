@@ -180,14 +180,17 @@ const applyAuthContext = (req, queryParams) => {
 
 const isPrivateHostname = hostname => {
   if (!hostname) return true;
-  const lower = hostname.toLowerCase();
+  // Node's URL parser keeps IPv6 hosts wrapped in brackets (e.g. "[::1]"),
+  // but net.isIP only recognises the unwrapped form.
+  const bare = hostname.replace(/^\[|\]$/g, '');
+  const lower = bare.toLowerCase();
   if (lower === 'localhost' || lower.endsWith('.localhost')) {
     return true;
   }
 
-  const ipVersion = net.isIP(hostname);
+  const ipVersion = net.isIP(bare);
   if (ipVersion === 4) {
-    const octets = hostname.split('.').map(Number);
+    const octets = bare.split('.').map(Number);
     if (octets[0] === 10) return true;
     if (octets[0] === 127) return true;
     if (octets[0] === 192 && octets[1] === 168) return true;
@@ -196,9 +199,8 @@ const isPrivateHostname = hostname => {
   }
 
   if (ipVersion === 6) {
-    const normalized = hostname.toLowerCase();
-    if (normalized === '::1') return true;
-    if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true;
+    if (lower === '::1') return true;
+    if (lower.startsWith('fc') || lower.startsWith('fd')) return true;
   }
 
   return false;
@@ -365,9 +367,10 @@ const fetchPreview = async targetUrl => {
 // Pinboard's published policy is one call per user per 3 seconds, so 20/min
 // is the maximum sustained rate their /posts/suggest endpoint will accept
 // before rate-limiting drops requests (observed as silent TCP hang-ups).
+const PREVIEW_RATE_LIMIT_MAX = Number.parseInt(process.env.PREVIEW_RATE_LIMIT_MAX, 10) || 20;
 const previewRateLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,
+  max: PREVIEW_RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many preview requests, please slow down.' },
