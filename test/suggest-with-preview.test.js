@@ -59,8 +59,23 @@ const resolveMock = (spec, config) => {
   throw new Error(`Unknown mock kind: ${spec.kind}`);
 };
 
+const capturedRequests = [];
+
+const readHeader = (headers, name) => {
+  if (!headers) return undefined;
+  if (typeof headers.get === 'function') {
+    return headers.get(name);
+  }
+  // axios normalises header keys to lowercase; try both as a safety net.
+  return headers[name] || headers[name.toLowerCase()];
+};
+
 axios.defaults.adapter = async (config) => {
   const url = config.url || '';
+  capturedRequests.push({
+    url,
+    userAgent: readHeader(config.headers, 'User-Agent')
+  });
   if (url.includes('api.pinboard.in/v1/posts/suggest')) {
     return resolveMock(mocks.pinboard, config);
   }
@@ -87,6 +102,7 @@ after(() => {
 beforeEach(() => {
   mocks.pinboard = null;
   mocks.preview = null;
+  capturedRequests.length = 0;
 });
 
 const baseUrl = () => `http://127.0.0.1:${server.address().port}`;
@@ -241,4 +257,17 @@ test('rejects private-network URL (SSRF guard)', async () => {
 
   assert.equal(res.status, 400);
   assert.match(body.error, /not reachable/i);
+});
+
+test('sends an identifying User-Agent on outbound Pinboard requests', async () => {
+  mocks.pinboard = successfulSuggestions();
+  mocks.preview = successfulPreview();
+
+  const res = await call(requestUrl());
+  assert.equal(res.status, 200);
+
+  const pinboardCall = capturedRequests.find(c => c.url.includes('api.pinboard.in'));
+  assert.ok(pinboardCall, 'expected an outbound call to api.pinboard.in');
+  assert.ok(pinboardCall.userAgent, 'User-Agent header should be set');
+  assert.match(pinboardCall.userAgent, /pinboard-bridge/i);
 });

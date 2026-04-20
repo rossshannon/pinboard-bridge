@@ -88,9 +88,14 @@ const xmlParser = new XMLParser({
   attributeNamePrefix: '@_',
 });
 
+const USER_AGENT = 'pinboard-bridge/2.0 (+https://github.com/rossshannon/pinboard-bridge)';
+
 // Axios configuration with timeout
 const apiRequestDefaults = {
   timeout: 30000, // 30 seconds timeout
+  headers: {
+    'User-Agent': USER_AGENT
+  }
 };
 
 const previewRequestConfig = {
@@ -101,7 +106,7 @@ const previewRequestConfig = {
   responseType: 'arraybuffer',
   headers: {
     Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
-    'User-Agent': 'pinboard-bridge/2.0 (+https://github.com/rossshannon/pinboard-bridge)'
+    'User-Agent': USER_AGENT
   },
   validateStatus: status => status >= 200 && status < 400,
 };
