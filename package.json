@@ -6,7 +6,8 @@
     "main": "web.js",
     "scripts": {
         "start": "node web.js",
-        "dev": "node web.js"
+        "dev": "node web.js",
+        "test": "node --test 'test/**/*.test.js'"
     },
     "dependencies": {
         "axios": "^1.13.2",

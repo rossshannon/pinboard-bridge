@@ -415,22 +415,36 @@ app.get('/posts/suggest-with-preview', previewRateLimiter, async (req, res) => {
 
     const [suggestionsResult, previewResult] = await Promise.allSettled([suggestionsPromise, previewPromise]);
 
+    // Auth failures from Pinboard must surface to the caller. Everything else
+    // degrades gracefully so a flaky Pinboard doesn't also wipe out the preview.
+    const SUGGEST_HARD_FAIL_STATUSES = new Set([401, 403]);
+
+    let suggestions = null;
+    let suggestionsError = null;
+    let suggestionsStatus = 'ok';
+
     if (suggestionsResult.status === 'rejected') {
       const error = suggestionsResult.reason;
-      if (error.response) {
-        const status = error.response.status;
+      const upstreamStatus = error.response?.status;
+
+      if (upstreamStatus && SUGGEST_HARD_FAIL_STATUSES.has(upstreamStatus)) {
         const message = typeof error.response.data === 'string'
           ? error.response.data
           : error.response.data?.error || 'API request failed';
-        return res.status(status).json({ error: message });
+        return res.status(upstreamStatus).json({ error: message });
       }
 
-      if (error.code === 'ECONNABORTED') {
-        return res.status(504).json({ error: 'Gateway timeout' });
+      suggestionsStatus = 'error';
+      if (upstreamStatus) {
+        suggestionsError = `Pinboard suggest returned ${upstreamStatus}`;
+      } else if (error.code === 'ECONNABORTED') {
+        suggestionsError = 'Pinboard suggest timed out';
+      } else {
+        suggestionsError = error.message || 'Pinboard suggest failed';
       }
-
       console.error('Pinboard suggest error:', error.message);
-      return res.status(500).json({ error: 'Internal server error' });
+    } else {
+      suggestions = suggestionsResult.value.data;
     }
 
     let preview = null;
@@ -445,17 +459,21 @@ app.get('/posts/suggest-with-preview', previewRateLimiter, async (req, res) => {
     }
 
     const payload = {
-      suggestions: suggestionsResult.value.data,
+      suggestions,
+      suggestionsStatus,
       preview,
       previewStatus
     };
 
+    if (suggestionsError) {
+      payload.suggestionsError = suggestionsError;
+    }
     if (previewError) {
       payload.previewError = previewError;
     }
 
     const outcome = preview ? 'preview_generated' : (previewError ? 'preview_failed' : 'preview_not_found');
-    console.info(`[preview] user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${outcome}` + (previewError ? ` message="${previewError}"` : ''));
+    console.info(`[preview] user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${outcome} suggestions=${suggestionsStatus}` + (previewError ? ` previewError="${previewError}"` : '') + (suggestionsError ? ` suggestionsError="${suggestionsError}"` : ''));
 
     return res.json(payload);
   } catch (error) {
@@ -554,3 +572,5 @@ const shutdown = () => {
 
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+module.exports = { app, server };
