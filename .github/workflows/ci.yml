@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      # Surfaces newly-published advisories on every push/PR. Non-blocking so a
+      # CVE in a transitive dep doesn't wedge unrelated changes; Dependabot
+      # opens the fix PR in parallel.
+      - name: Security audit
+        run: npm audit --audit-level=high
+        continue-on-error: true
