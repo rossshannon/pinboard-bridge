@@ -205,11 +205,22 @@ test('returns 504 on upstream timeout', async () => {
   assert.match(body.error, /timeout/i);
 });
 
-test('returns 500 on upstream network error without HTTP response', async () => {
+test('returns 503 on upstream network error (ECONNRESET)', async () => {
   mocks.upstream = { kind: 'network-error', message: 'socket hang up', code: 'ECONNRESET' };
 
   const res = await call('/v1/posts/all?format=json');
-  assert.equal(res.status, 500);
+  const body = await res.json();
+  assert.equal(res.status, 503);
+  assert.match(body.error, /unreachable/i);
+});
+
+test('returns 503 on DNS failure (ENOTFOUND)', async () => {
+  mocks.upstream = { kind: 'network-error', message: 'getaddrinfo ENOTFOUND api.pinboard.in', code: 'ENOTFOUND' };
+
+  const res = await call('/v1/tags/get?format=json');
+  const body = await res.json();
+  assert.equal(res.status, 503);
+  assert.match(body.error, /unreachable/i);
 });
 
 test('forwards repeated query params (array values) as repeated keys to Pinboard', async () => {

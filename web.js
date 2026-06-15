@@ -581,6 +581,12 @@ app.get('/v1/*', async (req, res) => {
       return res.status(504).json({ error: 'Gateway timeout' });
     }
 
+    // Handle network-layer errors (DNS failure, connection refused, reset)
+    if (['ENOTFOUND', 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET'].includes(error.code)) {
+      console.error('Pinboard API unreachable:', error.message);
+      return res.status(503).json({ error: 'Pinboard API is unreachable' });
+    }
+
     // Handle other errors
     console.error('Server error:', error.message);
     res.status(500).json({ error: 'Internal server error' });
