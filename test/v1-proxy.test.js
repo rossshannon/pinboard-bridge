@@ -240,3 +240,43 @@ test('returns 500 when upstream XML is malformed', async () => {
   const body = await res.json();
   assert.ok(body, 'response must be JSON');
 });
+
+test('CORS preflights do not consume the per-IP rate limit budget', async () => {
+  mocks.upstream = { kind: 'success', data: { a: 1 } };
+
+  const first = await call('/v1/tags/get?format=json');
+  const remainingAfterFirst = Number(first.headers.get('ratelimit-remaining'));
+  assert.ok(Number.isFinite(remainingAfterFirst), 'expected RateLimit-Remaining header');
+
+  const preflight = await fetch(`${baseUrl()}/v1/tags/get?format=json`, {
+    method: 'OPTIONS',
+    headers: {
+      'Origin': 'https://example.com',
+      'Access-Control-Request-Method': 'GET',
+      'Access-Control-Request-Headers': 'Authorization'
+    }
+  });
+  assert.ok(preflight.status >= 200 && preflight.status < 300);
+  assert.equal(preflight.headers.get('ratelimit-remaining'), null);
+
+  const second = await call('/v1/tags/get?format=json');
+  const remainingAfterSecond = Number(second.headers.get('ratelimit-remaining'));
+  assert.equal(remainingAfterSecond, remainingAfterFirst - 1);
+});
+
+test('large JSON responses are gzipped when the client accepts it', async () => {
+  // Roughly what /v1/tags/get looks like for an account with many tags.
+  const tags = {};
+  for (let i = 0; i < 5000; i += 1) {
+    tags[`tag_number_${i}`] = i % 37;
+  }
+  mocks.upstream = { kind: 'success', data: tags };
+
+  const res = await call('/v1/tags/get?format=json', {
+    headers: { 'Accept-Encoding': 'gzip' }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('content-encoding'), 'gzip');
+  const body = await res.json();
+  assert.equal(Object.keys(body).length, 5000);
+});

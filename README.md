@@ -6,13 +6,14 @@ A CORS-enabled proxy service for the Pinboard API with enhanced security feature
 
 - **CORS Support**: Configurable cross-origin resource sharing with JSON error responses
 - **Security Headers**: Helmet.js integration for secure HTTP headers
-- **Rate Limiting**: 100 requests per 15 minutes per IP address
+- **Rate Limiting**: 300 requests per 15 minutes per IP address (matching Pinboard's own one-call-per-three-seconds guidance); CORS preflights are not counted
+- **Compressed Responses**: gzip/brotli via `compression`, which shrinks a large account's `/v1/tags/get` by roughly 80%
+- **Preflight Caching**: `Access-Control-Max-Age` lets browsers skip the CORS preflight on repeat requests
 - **Header-based Authentication**: Keeps Pinboard credentials out of URLs
 - **XML to JSON Conversion**: Automatic XML response conversion using fast-xml-parser
 - **Health Check Endpoint**: Monitor service status at `/health`
 - **Graceful Shutdown**: Proper handling of SIGTERM/SIGINT signals
 - **Error Handling**: Comprehensive error handling with consistent JSON responses
-- **Preview API**: Server-side endpoint that scrapes Twitter/Open Graph metadata alongside Pinboard suggestions
 - **Preview API**: Server-side endpoint that scrapes Twitter/Open Graph metadata alongside Pinboard suggestions
 
 ## Requirements
@@ -39,6 +40,8 @@ cp .env.example .env
 | `PORT` | Server port | 1337 | No |
 | `NODE_ENV` | Environment mode | development | No |
 | `ALLOWED_ORIGINS` | Comma-separated list of allowed CORS origins | (all origins) | No |
+| `IP_RATE_LIMIT_MAX` | Requests allowed per source IP per 15 minutes on `/v1/*` | 300 | No |
+| `PREVIEW_RATE_LIMIT_MAX` | `/posts/suggest-with-preview` requests allowed per token per minute | 20 | No |
 
 **CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` defaults to the Pincushion frontend at `https://rossshannon.github.com`:
 
@@ -55,9 +58,15 @@ ALLOWED_ORIGINS=https://rossshannon.github.com
 
 ### Rate Limiting
 
-- 100 requests per 15 minutes are allowed per source IP. Heroku users should ensure `app.set('trust proxy', 1)` remains enabled so the limiter sees client IPs.
+- 300 requests per 15 minutes are allowed per source IP on `/v1/*`. This mirrors Pinboard's published guidance of one call per user per three seconds. Heroku users should ensure `app.set('trust proxy', 1)` remains enabled so the limiter sees client IPs.
+- CORS preflight (`OPTIONS`) requests are not counted. Browsers must preflight every call because of the `Authorization` header, so counting them would halve the usable budget.
 - When throttled, responses include standard `RateLimit-*` headers so the UI can surface “retry-after” information.
-- `/posts/suggest-with-preview` adds a per-token limiter (30 requests/minute) to prevent abusive preview scraping.
+- `/posts/suggest-with-preview` adds a per-token limiter (20 requests/minute) to prevent abusive preview scraping and to stay within Pinboard's own limits.
+
+### Response Compression and Preflight Caching
+
+- Responses are gzip/brotli compressed when the client sends `Accept-Encoding`. Heroku's router does not compress on your behalf, and `/v1/tags/get` for an account with thousands of tags is a couple of hundred kilobytes of JSON uncompressed.
+- Preflight responses include `Access-Control-Max-Age: 86400`, so a browser only pays the extra round trip once per URL (Chrome caps the cache at two hours).
 
 ## Running Locally
 
@@ -173,13 +182,18 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 
 - Helmet.js security headers
 - CORS origin validation with explicit 403 JSON responses for disallowed origins
-- Rate limiting per IP
+- Rate limiting per IP (300 per 15 minutes on `/v1/*`)
 - Per-token preview throttling and structured preview logging
 - 30-second request timeout
 - Sanitized error messages without leaking upstream responses
 - Authorization headers only (tokens never logged in URLs)
 
 ## Changelog
+
+### Version 2.1.0
+- Compress responses with `compression` (gzip/brotli); `/v1/tags/get` shrinks by roughly 80% for large accounts
+- Send `Access-Control-Max-Age` on preflight responses so browsers cache the CORS verdict
+- Stop counting CORS preflights against the per-IP limiter, and raise that limit from 100 to 300 per 15 minutes to match Pinboard's own cadence (`IP_RATE_LIMIT_MAX` overrides it)
 
 ### Version 2.0.0
 - Require Authorization headers and ignore inbound `auth_token` query parameters

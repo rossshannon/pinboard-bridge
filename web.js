@@ -5,6 +5,7 @@ const express = require('express');
 const http = require('http');
 const helmet = require('helmet');
 const cors = require('cors');
+const compression = require('compression');
 const net = require('net');
 const rateLimit = require('express-rate-limit');
 
@@ -17,6 +18,16 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 const PINBOARD_BASE_URL = 'https://api.pinboard.in';
 const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 const PREVIEW_TIMEOUT_MS = 5000;
+// Browsers must preflight every call to this bridge (the Authorization
+// header is not CORS-safelisted). Letting them cache the preflight verdict
+// saves a full round trip on repeat requests to the same URL, e.g.
+// /v1/tags/get. Chrome caps this at 2h, Firefox at 24h.
+const CORS_PREFLIGHT_MAX_AGE_SECONDS = 24 * 60 * 60;
+// Pinboard asks clients for at most one call per user per three seconds,
+// which works out at 300 per 15 minutes. Match that, rather than imposing a
+// tighter ceiling that a single bookmarking session can trip.
+const IP_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const IP_RATE_LIMIT_MAX = Number.parseInt(process.env.IP_RATE_LIMIT_MAX, 10) || 300;
 
 // Log startup configuration
 console.log(`Starting Pinboard Bridge in ${NODE_ENV} mode`);
@@ -35,13 +46,21 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
 }));
 
-// Rate limiting - 100 requests per 15 minutes per IP
+// Gzip/brotli response bodies. Heroku's router does not compress, and a large
+// Pinboard account's /v1/tags/get is a couple of hundred KB of JSON that
+// shrinks by roughly 80%.
+app.use(compression());
+
+// Rate limiting per IP for the generic proxy routes. CORS preflights are
+// skipped: they never reach Pinboard, and counting them would halve the
+// number of real requests a browser client could make.
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
+  windowMs: IP_RATE_LIMIT_WINDOW_MS,
+  max: IP_RATE_LIMIT_MAX,
   standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
   legacyHeaders: false, // Disable the `X-RateLimit-*` headers
   message: { error: 'Too many requests, please try again later.' },
+  skip: req => req.method === 'OPTIONS',
 });
 
 app.use('/v1/', limiter);
@@ -65,6 +84,7 @@ const corsOptions = {
   credentials: true,
   methods: ['GET', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Requested-With', 'X-HTTP-Method-Override', 'Origin', 'Accept', 'Authorization'],
+  maxAge: CORS_PREFLIGHT_MAX_AGE_SECONDS,
 };
 
 app.use(cors(corsOptions));
