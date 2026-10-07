@@ -67,3 +67,17 @@ test('request without an Origin header passes through (curl / server-to-server)'
   const res = await fetch(`${baseUrl()}/health`);
   assert.equal(res.status, 200);
 });
+
+test('preflight responses carry Access-Control-Max-Age so browsers cache the verdict', async () => {
+  const res = await fetch(`${baseUrl()}/v1/tags/get`, {
+    method: 'OPTIONS',
+    headers: {
+      'Origin': 'https://allowed.example.com',
+      'Access-Control-Request-Method': 'GET',
+      'Access-Control-Request-Headers': 'Authorization'
+    }
+  });
+
+  assert.ok(res.status >= 200 && res.status < 300, `expected 2xx, got ${res.status}`);
+  assert.equal(res.headers.get('access-control-max-age'), String(24 * 60 * 60));
+});
