@@ -280,3 +280,15 @@ test('large JSON responses are gzipped when the client accepts it', async () => 
   const body = await res.json();
   assert.equal(Object.keys(body).length, 5000);
 });
+
+test('responses are marked no-store and carry no ETag, so browsers never cache account data', async () => {
+  mocks.upstream = { kind: 'success', data: { a: 1 } };
+  const res = await call('/v1/tags/get?format=json');
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('cache-control'), 'no-store');
+  assert.equal(res.headers.get('etag'), null);
+
+  const health = await fetch(`${baseUrl()}/health`);
+  assert.equal(health.headers.get('cache-control'), 'no-store');
+  assert.equal(health.headers.get('etag'), null);
+});

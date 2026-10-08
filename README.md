@@ -67,6 +67,7 @@ ALLOWED_ORIGINS=https://rossshannon.github.com
 
 - Responses are gzip/brotli compressed when the client sends `Accept-Encoding`. Heroku's router does not compress on your behalf, and `/v1/tags/get` for an account with thousands of tags is a couple of hundred kilobytes of JSON uncompressed.
 - Preflight responses include `Access-Control-Max-Age: 86400`, so a browser only pays the extra round trip once per URL (Chrome caps the cache at two hours).
+- Every response is sent with `Cache-Control: no-store` and without an ETag. The bridge only ever returns a private view of one account, so a browser's HTTP cache must never hold it; the preflight cache above is unaffected.
 
 ## Running Locally
 
@@ -187,8 +188,12 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - 30-second request timeout
 - Sanitized error messages without leaking upstream responses
 - Authorization headers only (tokens never logged in URLs)
+- `Cache-Control: no-store` on every response, no ETags, so account data never lands in a browser cache
 
 ## Changelog
+
+### Version 2.1.1
+- Send `Cache-Control: no-store` on every response and disable Express ETags, so bookmark and tag JSON is never written to a browser's HTTP cache
 
 ### Version 2.1.0
 - Compress responses with `compression` (gzip/brotli); `/v1/tags/get` shrinks by roughly 80% for large accounts
