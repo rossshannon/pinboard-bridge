@@ -18,8 +18,8 @@ A CORS-enabled proxy service for the Pinboard API with enhanced security feature
 
 ## Requirements
 
-- Node.js 18+ (matches the Heroku-24 build image)
-- npm 8+
+- Node.js 24.x (pinned in `engines`; runs on the Heroku-26 stack)
+- npm 11+
 - Your Pinboard API token (`username:XXXXXX` as shown in Pinboard settings). The bridge does **not** accept raw account passwords.
 
 ## Installation
@@ -149,7 +149,7 @@ This endpoint keeps preview scraping on the server (no extra browser permissions
 
 ### Heroku (recommended)
 
-1. Provision an app on the `heroku-24` stack.
+1. Provision an app on the `heroku-26` stack (`heroku create --stack heroku-26`, or `heroku stack:set heroku-26` on an existing app followed by a fresh deploy).
 2. Set config vars (at minimum `NODE_ENV=production` and your chosen `ALLOWED_ORIGINS`).
 3. Push the main branch:
 
@@ -191,6 +191,10 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - `Cache-Control: no-store` on every response, no ETags, so account data never lands in a browser cache
 
 ## Changelog
+
+### Version 2.2.0
+- Move to the Heroku-26 stack (Ubuntu 26.04, supported until April 2031); `heroku.yml` and the new `app.json` both declare `heroku-26`
+- Bump axios to 1.20, cheerio to 1.2, express to 4.22.3, fast-xml-parser to 5.11 and helmet to 8.3, clearing advisories in proxy-addr (critical), axios, form-data, undici, body-parser and qs
 
 ### Version 2.1.1
 - Send `Cache-Control: no-store` on every response and disable Express ETags, so bookmark and tag JSON is never written to a browser's HTTP cache

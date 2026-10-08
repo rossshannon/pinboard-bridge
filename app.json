@@ -1,0 +1,10 @@
+{
+    "name": "pinboard-bridge",
+    "description": "Pinboard API proxy service",
+    "repository": "https://github.com/rossshannon/pinboard-bridge",
+    "stack": "heroku-26",
+    "buildpacks": [{ "url": "heroku/nodejs" }],
+    "env": {
+        "NODE_ENV": { "value": "production" }
+    }
+}
