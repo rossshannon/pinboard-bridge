@@ -40,6 +40,18 @@ const server = http.createServer(app);
 // Trust proxy - required for rate limiting behind Heroku
 app.set('trust proxy', 1);
 
+// Every response here is either a private, authenticated view of a
+// Pinboard account or a health probe: nothing a browser should keep. Express
+// would otherwise attach a validator ETag to each JSON body, which invites
+// browsers to store bookmark and tag data in their disk cache and revalidate
+// it. (The CORS preflight cache is separate and still honours
+// Access-Control-Max-Age.)
+app.disable('etag');
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
+
 // Security headers
 app.use(helmet({
   contentSecurityPolicy: false, // Not needed for API
