@@ -64,8 +64,8 @@ ALLOWED_ORIGINS=https://rossshannon.github.com
 - 300 requests per 15 minutes are allowed per source IP on `/v1/*`. This mirrors Pinboard's published guidance of one call per user per three seconds. Heroku users should ensure `app.set('trust proxy', 1)` remains enabled so the limiter sees client IPs.
 - CORS preflight (`OPTIONS`) requests are not counted. Browsers must preflight every call because of the `Authorization` header, so counting them would halve the usable budget.
 - When throttled, responses include standard `RateLimit-*` headers so the UI can surface “retry-after” information.
-- `/posts/suggest-with-preview` adds a per-token limiter (20 requests/minute) to prevent abusive preview scraping and to stay within Pinboard's own limits. `/preview` makes no Pinboard call, so its per-token limit is looser (60 requests/minute).
-- Pinboard asks for at most one call per user every three seconds. The bridge spaces calls for the same user that far apart (start to start) by holding a later call until its slot. A call that would have to wait more than `PINBOARD_MAX_QUEUE_MS` is sent straight away instead, so a burst never queues towards Heroku's 30-second router timeout.
+- `/posts/suggest-with-preview` adds a per-token limiter (20 requests/minute) to prevent abusive preview scraping and to stay within Pinboard's own limits. `/preview` makes no Pinboard call, so its per-token limit is looser (60 requests/minute); it also counts against the per-IP limit above.
+- Pinboard asks for at most one call per user every three seconds. The bridge spaces calls for the same user that far apart (start to start) by holding a later call until its slot. A call that would have to wait more than `PINBOARD_MAX_QUEUE_MS` is sent straight away instead, so a burst never queues towards Heroku's 30-second router timeout, and time spent waiting is taken off the call's 30-second Pinboard timeout. Slots are keyed on the whole `Authorization` header, so a request with someone else's username and a wrong token can't use up their slots.
 
 ### Response Compression and Preflight Caching
 
@@ -154,7 +154,7 @@ This endpoint keeps preview scraping on the server (no extra browser permissions
 **Limits & logging**
 
 - Preview fetches are limited to 30 requests per minute per Authorization token.
-- Each request logs `{user, targetHost, outcome}` (`preview_generated`, `preview_not_found`, or `preview_failed`) to help spot misuse without storing the raw token, plus `suggestMs` and `previewMs`: how long each half took.
+- Each request logs `{user, targetHost, outcome}` (`preview_generated`, `preview_not_found`, or `preview_failed`) to help spot misuse without storing the raw token, plus `suggestMs` and `previewMs`: how long each half took, as the user saw it (`suggestMs` includes any time spent waiting for the user's Pinboard slot).
 - Every Pinboard call also logs a `[pinboard]` line with the endpoint, `waitMs` (time held for the user's slot) and `upstreamMs` (time Pinboard took).
 
 ## Deployment
@@ -208,7 +208,7 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - Add `/preview`, which returns page metadata without waiting on Pinboard's `posts/suggest`
 - Space Pinboard calls for the same user three seconds apart, per Pinboard's guidance (`PINBOARD_MIN_INTERVAL_MS`, `PINBOARD_MAX_QUEUE_MS`)
 - Read preview pages only as far as `</head>`, under one 5-second deadline for the whole fetch
-- Keep connections to `api.pinboard.in` alive between calls
+- Harden the preview fetcher's SSRF guard: refuse hostnames that resolve to private addresses, redirects to private hosts, and `0.0.0.0/8`, `100.64.0.0/10`, link-local IPv6 and IPv4-mapped IPv6 addresses
 - Log how long Pinboard and the preview fetch each took
 
 ### Version 2.2.0

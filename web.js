@@ -3,7 +3,8 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const express = require('express');
 const http = require('http');
-const https = require('https');
+const crypto = require('crypto');
+const dns = require('dns');
 const helmet = require('helmet');
 const cors = require('cors');
 const compression = require('compression');
@@ -138,21 +139,15 @@ const xmlParser = new XMLParser({
 
 const USER_AGENT = 'pinboard-bridge/2.0 (+https://github.com/rossshannon/pinboard-bridge)';
 
-// Reuse TLS connections to api.pinboard.in rather than paying a fresh
-// handshake on every call.
-const pinboardAgent = new https.Agent({ keepAlive: true, maxSockets: 32 });
-
 // Axios configuration with timeout
 const apiRequestDefaults = {
   timeout: 30000, // 30 seconds timeout
-  httpsAgent: pinboardAgent,
   headers: {
     'User-Agent': USER_AGENT
   }
 };
 
 const previewRequestConfig = {
-  timeout: PREVIEW_TIMEOUT_MS,
   maxRedirects: 3,
   maxContentLength: PREVIEW_MAX_BYTES,
   maxBodyLength: PREVIEW_MAX_BYTES,
@@ -166,13 +161,18 @@ const previewRequestConfig = {
 
 // Per-user spacing of Pinboard calls. Each user has a next free slot; a call
 // takes the later of now and that slot, and pushes the slot one interval on.
+// Slots are keyed on the whole credential, not the username alone, so a
+// request carrying someone else's username and a wrong token can't use up
+// their slots.
 const pinboardNextSlotAt = new Map();
+let lastSlotSweepAt = 0;
 
-const reservePinboardSlot = identity => {
+const reservePinboardSlot = slotKey => {
   if (PINBOARD_MIN_INTERVAL_MS === 0) return 0;
-  const key = String(identity || '').toLowerCase();
+  const key = slotKey;
   const now = Date.now();
-  if (pinboardNextSlotAt.size > 1000) {
+  if (pinboardNextSlotAt.size > 1000 && now - lastSlotSweepAt > 1000) {
+    lastSlotSweepAt = now;
     for (const [user, slotAt] of pinboardNextSlotAt) {
       if (slotAt < now) pinboardNextSlotAt.delete(user);
     }
@@ -192,14 +192,17 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 // long it queued and how long Pinboard took. The URL is not logged: it can
 // carry the auth token.
 const pinboardGet = async (url, authContext, label) => {
-  const waitMs = reservePinboardSlot(authContext.identity);
+  const waitMs = reservePinboardSlot(authContext.slotKey);
   if (waitMs > 0) {
     await sleep(waitMs);
   }
   const startedAt = Date.now();
   let outcome = 'ok';
   try {
-    return await axios.get(url, authContext.requestConfig);
+    // Time spent queueing comes out of the 30s budget, so the whole request
+    // still fits inside Heroku's router timeout.
+    const timeout = Math.max(1000, apiRequestDefaults.timeout - waitMs);
+    return await axios.get(url, { ...authContext.requestConfig, timeout });
   } catch (error) {
     outcome = error.response?.status ? String(error.response.status) : (error.code || 'error');
     throw error;
@@ -251,6 +254,7 @@ const applyAuthContext = (req, queryParams) => {
   }
 
   const authHeader = req.get('authorization') || '';
+  const slotKey = crypto.createHash('sha256').update(authHeader).digest('hex');
   const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
   const basicMatch = authHeader.match(/^Basic\s+(.+)$/i);
 
@@ -264,7 +268,8 @@ const applyAuthContext = (req, queryParams) => {
         ...apiRequestDefaults,
         auth: { username, password }
       },
-      identity: username
+      identity: username,
+      slotKey
     };
   }
 
@@ -278,11 +283,50 @@ const applyAuthContext = (req, queryParams) => {
     }
     return {
       requestConfig: { ...apiRequestDefaults },
-      identity: authToken.split(':')[0] || 'token'
+      identity: authToken.split(':')[0] || 'token',
+      slotKey
     };
   }
 
   throw new Error('Authorization header required');
+};
+
+const isPrivateIPv4 = address => {
+  const octets = address.split('.').map(Number);
+  if (octets[0] === 0) return true; // 0.0.0.0/8 ("this host")
+  if (octets[0] === 10) return true;
+  if (octets[0] === 127) return true;
+  if (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) return true; // CGNAT
+  if (octets[0] === 169 && octets[1] === 254) return true;
+  if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) return true;
+  if (octets[0] === 192 && octets[1] === 168) return true;
+  return false;
+};
+
+// True for any IP address the preview fetcher must not reach.
+const isPrivateAddress = address => {
+  const bare = String(address || '').replace(/^\[|\]$/g, '').toLowerCase();
+  const ipVersion = net.isIP(bare);
+  if (ipVersion === 4) return isPrivateIPv4(bare);
+  if (ipVersion === 6) {
+    if (bare === '::' || bare === '::1') return true;
+    if (bare.startsWith('fc') || bare.startsWith('fd')) return true; // unique local
+    if (/^fe[89ab]/.test(bare)) return true; // link-local
+    // IPv4-mapped (::ffff:a.b.c.d, which URL parsing rewrites as ::ffff:xxxx:xxxx)
+    const mapped = bare.match(/^::ffff:(.+)$/);
+    if (mapped) {
+      const tail = mapped[1];
+      if (net.isIP(tail) === 4) return isPrivateIPv4(tail);
+      const hex = tail.split(':');
+      if (hex.length === 2) {
+        const high = parseInt(hex[0], 16);
+        const low = parseInt(hex[1], 16);
+        return isPrivateIPv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+      }
+    }
+    return false;
+  }
+  return false;
 };
 
 const isPrivateHostname = hostname => {
@@ -294,23 +338,34 @@ const isPrivateHostname = hostname => {
   if (lower === 'localhost' || lower.endsWith('.localhost')) {
     return true;
   }
+  return net.isIP(bare) ? isPrivateAddress(bare) : false;
+};
 
-  const ipVersion = net.isIP(bare);
-  if (ipVersion === 4) {
-    const octets = bare.split('.').map(Number);
-    if (octets[0] === 10) return true;
-    if (octets[0] === 127) return true;
-    if (octets[0] === 192 && octets[1] === 168) return true;
-    if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) return true;
-    if (octets[0] === 169 && octets[1] === 254) return true;
+// DNS lookup for preview fetches that refuses names resolving to private
+// addresses, so a public hostname pointed at 10.x or 169.254.169.254 can't
+// be used to reach the dyno's network.
+const guardedLookup = (hostname, options, callback) => {
+  if (typeof options === 'function') {
+    callback = options;
+    options = {};
   }
+  dns.lookup(hostname, options, (err, address, family) => {
+    if (err) return callback(err);
+    const addresses = Array.isArray(address) ? address : [{ address, family }];
+    if (addresses.some(entry => isPrivateAddress(entry.address))) {
+      const blocked = new Error(`Preview host ${hostname} resolves to a private address`);
+      blocked.code = 'EPRIVATEADDRESS';
+      return callback(blocked);
+    }
+    return callback(null, address, family);
+  });
+};
 
-  if (ipVersion === 6) {
-    if (lower === '::1') return true;
-    if (lower.startsWith('fc') || lower.startsWith('fd')) return true;
+// Redirects to a literal private IP skip DNS altogether, so check each hop.
+const guardRedirect = options => {
+  if (isPrivateHostname(options.hostname)) {
+    throw new Error('Preview redirected to a host that is not reachable from the proxy');
   }
-
-  return false;
 };
 
 const resolveAbsoluteUrl = (baseUrl, value) => {
@@ -468,6 +523,7 @@ const readHead = async data => {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let length = 0;
+    let carry = '';
     let settled = false;
     const finish = () => {
       if (settled) return;
@@ -476,13 +532,13 @@ const readHead = async data => {
       resolve(Buffer.concat(chunks).toString('utf8'));
     };
     data.on('data', chunk => {
-      // Search from a little before this chunk so a tag split across two
-      // chunks is still found.
-      const searchFrom = Math.max(0, length - HEAD_CLOSE.length);
       chunks.push(chunk);
       length += chunk.length;
-      const tail = Buffer.concat(chunks).subarray(searchFrom).toString('latin1').toLowerCase();
-      if (tail.includes(HEAD_CLOSE) || length >= PREVIEW_HEAD_MAX_BYTES) {
+      // Search this chunk plus the end of the previous one, so a tag split
+      // across two chunks is still found.
+      const window = carry + chunk.toString('latin1').toLowerCase();
+      carry = window.slice(-HEAD_CLOSE.length);
+      if (window.includes(HEAD_CLOSE) || length >= PREVIEW_HEAD_MAX_BYTES) {
         finish();
       }
     });
@@ -503,6 +559,8 @@ const fetchPreview = async targetUrl => {
   try {
     const response = await axios.get(targetUrl.toString(), {
       ...previewRequestConfig,
+      lookup: guardedLookup,
+      beforeRedirect: guardRedirect,
       signal: controller.signal
     });
     const finalUrl = response.request?.res?.responseUrl || targetUrl.toString();
@@ -519,6 +577,9 @@ const fetchPreview = async targetUrl => {
   } catch (error) {
     if (controller.signal.aborted) {
       throw new Error(`Preview fetch timed out after ${PREVIEW_TIMEOUT_MS}ms`);
+    }
+    if (error.code === 'EPRIVATEADDRESS' || error.cause?.code === 'EPRIVATEADDRESS') {
+      throw new Error('URL host is not reachable from the proxy');
     }
     throw error;
   } finally {
@@ -613,7 +674,7 @@ app.get('/health', (req, res) => {
 
 // Page preview on its own: no Pinboard call, so it returns as soon as the
 // page has been read, however slow Pinboard's suggest is.
-app.get('/preview', pagePreviewRateLimiter, async (req, res) => {
+app.get('/preview', limiter, pagePreviewRateLimiter, async (req, res) => {
   try {
     const normalizedUrl = parsePreviewTarget(req, res);
     if (!normalizedUrl) return;
@@ -625,7 +686,12 @@ app.get('/preview', pagePreviewRateLimiter, async (req, res) => {
       return res.status(401).json({ error: err.message });
     }
 
-    const [previewResult] = await Promise.allSettled([timed(fetchPreview(normalizedUrl))]);
+    let previewResult;
+    try {
+      previewResult = { status: 'fulfilled', value: await timed(fetchPreview(normalizedUrl)) };
+    } catch (reason) {
+      previewResult = { status: 'rejected', reason };
+    }
     const { preview, previewStatus, previewError, previewMs } = summarisePreview(previewResult);
 
     const payload = { preview, previewStatus };
@@ -824,4 +890,4 @@ const shutdown = () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-module.exports = { app, server };
+module.exports = { app, server, isPrivateAddress, isPrivateHostname, guardRedirect };

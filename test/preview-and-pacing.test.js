@@ -189,3 +189,35 @@ test('suggest-with-preview logs how long each half took', async () => {
   assert.match(pinboardLine, /call=posts\/suggest waitMs=\d+ upstreamMs=\d+ outcome=ok/);
   assert.ok(!pinboardLine.includes('secret'), 'credentials must not be logged');
 });
+
+test('spacing is keyed on the whole credential, so a wrong token cannot use up a user\'s slots', async () => {
+  const withToken = token => fetch(`${baseUrl()}/v1/posts/get?format=json&url=a`, {
+    headers: { Authorization: 'Basic ' + Buffer.from(`alice:${token}`).toString('base64') }
+  });
+  await Promise.all([withToken('wrong'), withToken('secret')]);
+
+  const pinboardCalls = calls.filter(c => c.url.includes('api.pinboard.in'));
+  assert.equal(pinboardCalls.length, 2);
+  const gap = Math.abs(pinboardCalls[1].at - pinboardCalls[0].at);
+  assert.ok(gap < 200, `expected no spacing between different credentials, got a ${gap}ms gap`);
+});
+
+test('time spent queueing comes out of the Pinboard timeout', async () => {
+  const timeouts = [];
+  const originalAdapter = axios.defaults.adapter;
+  axios.defaults.adapter = async config => {
+    if (config.url.startsWith('https://api.pinboard.in/')) timeouts.push(config.timeout);
+    return originalAdapter(config);
+  };
+  try {
+    await Promise.all([
+      call('/v1/posts/get?format=json&url=1'),
+      call('/v1/posts/get?format=json&url=2')
+    ]);
+  } finally {
+    axios.defaults.adapter = originalAdapter;
+  }
+  timeouts.sort((a, b) => b - a);
+  assert.equal(timeouts[0], 30000);
+  assert.ok(timeouts[1] <= 29720 && timeouts[1] >= 29600, `expected ~29700ms, got ${timeouts[1]}`);
+});
