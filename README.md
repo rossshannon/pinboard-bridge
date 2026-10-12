@@ -222,7 +222,7 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - Key the `/preview` and `/posts/suggest-with-preview` rate limits on the client IP, since the `Authorization` header isn't checked there
 - Only return http(s) links in previews; resolve relative links and take the site domain from the page actually fetched
 - Log how long Pinboard and the preview fetch each took, with usernames stripped of characters that could forge log lines
-- Drop a queued Pinboard call if the client has already disconnected (giving its slot to the next call), and cap queueing plus the Pinboard call at 25 seconds
+- Drop a queued Pinboard call as soon as its client disconnects, moving the calls behind it up the queue, and cap queueing plus the Pinboard call at 25 seconds
 
 ### Version 2.2.0
 - Move to the Heroku-26 stack (Ubuntu 26.04, supported until April 2031); `heroku.yml` and the new `app.json` both declare `heroku-26`

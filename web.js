@@ -184,57 +184,97 @@ const previewRequestConfig = {
   validateStatus: status => status >= 200 && status < 400,
 };
 
-// Per-user spacing of Pinboard calls. Each user has a next free slot; a call
-// takes the later of now and that slot, and pushes the slot one interval on.
-// Slots are keyed on the whole credential, not the username alone, so a
-// request carrying someone else's username and a wrong token can't use up
-// their slots.
-const pinboardNextSlotAt = new Map();
-let lastSlotSweepAt = 0;
+// Per-user spacing of Pinboard calls. Each user has a queue: a call starts
+// one interval after the previous call started (or would start), or at once
+// if nothing is ahead of it. Queues are keyed on the whole credential, not the
+// username alone, so a request carrying someone else's username and a wrong
+// token can't use up their slots.
+const pinboardQueues = new Map();
+let lastQueueSweepAt = 0;
 
-const reservePinboardSlot = slotKey => {
-  if (PINBOARD_MIN_INTERVAL_MS === 0) return { waitMs: 0, reservedUntil: null };
-  const key = slotKey;
-  const now = Date.now();
-  if (pinboardNextSlotAt.size > 1000 && now - lastSlotSweepAt > 1000) {
-    lastSlotSweepAt = now;
-    for (const [user, slotAt] of pinboardNextSlotAt) {
-      if (slotAt < now) pinboardNextSlotAt.delete(user);
+const sweepPinboardQueues = now => {
+  if (pinboardQueues.size <= 1000 || now - lastQueueSweepAt <= 1000) return;
+  lastQueueSweepAt = now;
+  for (const [key, queue] of pinboardQueues) {
+    if (queue.waiting.length === 0 && queue.lastStartAt + PINBOARD_MIN_INTERVAL_MS < now) {
+      pinboardQueues.delete(key);
     }
   }
-  const slotAt = Math.max(now, pinboardNextSlotAt.get(key) || 0);
-  const waitMs = slotAt - now;
-  if (waitMs > PINBOARD_MAX_QUEUE_MS) {
-    return { waitMs: 0, reservedUntil: null };
-  }
-  const reservedUntil = slotAt + PINBOARD_MIN_INTERVAL_MS;
-  pinboardNextSlotAt.set(key, reservedUntil);
-  return { waitMs, reservedUntil };
 };
 
-// Give back a slot whose call was never made, if no later call has queued
-// behind it, so the user's next call doesn't wait for nothing.
-const releasePinboardSlot = (slotKey, reservedUntil) => {
-  if (reservedUntil !== null && pinboardNextSlotAt.get(slotKey) === reservedUntil) {
-    pinboardNextSlotAt.set(slotKey, reservedUntil - PINBOARD_MIN_INTERVAL_MS);
+// Work out when each waiting call starts, and (re)arm its timer.
+const schedulePinboardQueue = queue => {
+  let previousStart = queue.lastStartAt;
+  for (const entry of queue.waiting) {
+    const startAt = Math.max(Date.now(), previousStart + PINBOARD_MIN_INTERVAL_MS);
+    if (startAt !== entry.startAt) {
+      entry.startAt = startAt;
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => startPinboardEntry(queue, entry), startAt - Date.now());
+    }
+    previousStart = startAt;
   }
 };
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const startPinboardEntry = (queue, entry) => {
+  const index = queue.waiting.indexOf(entry);
+  if (index === -1) return;
+  queue.waiting.splice(index, 1);
+  queue.lastStartAt = Date.now();
+  entry.resolve();
+};
+
+// Queue a Pinboard call. `ready` resolves when it may start; `cancel` takes a
+// call that hasn't started out of the queue, so the calls behind it move up.
+const queuePinboardCall = slotKey => {
+  const now = Date.now();
+  const immediate = { ready: Promise.resolve(), cancel: () => {} };
+  if (PINBOARD_MIN_INTERVAL_MS === 0) return immediate;
+  sweepPinboardQueues(now);
+  let queue = pinboardQueues.get(slotKey);
+  if (!queue) {
+    queue = { lastStartAt: -Infinity, waiting: [] };
+    pinboardQueues.set(slotKey, queue);
+  }
+  const previousStart = queue.waiting.length
+    ? queue.waiting[queue.waiting.length - 1].startAt
+    : queue.lastStartAt;
+  const startAt = Math.max(now, previousStart + PINBOARD_MIN_INTERVAL_MS);
+  if (startAt === now) {
+    queue.lastStartAt = now;
+    return immediate;
+  }
+  if (startAt - now > PINBOARD_MAX_QUEUE_MS) {
+    // Queueing this long would eat too much of the time budget: send it now.
+    return immediate;
+  }
+  const entry = { startAt: null, timer: null, resolve: null };
+  const ready = new Promise(resolve => { entry.resolve = resolve; });
+  queue.waiting.push(entry);
+  schedulePinboardQueue(queue);
+  const cancel = () => {
+    const index = queue.waiting.indexOf(entry);
+    if (index === -1) return;
+    queue.waiting.splice(index, 1);
+    clearTimeout(entry.timer);
+    entry.resolve();
+    schedulePinboardQueue(queue);
+  };
+  return { ready, cancel };
+};
 
 // GET a Pinboard API URL on behalf of a user, spaced per user, and log how
 // long it queued and how long Pinboard took. The URL is not logged: it can
 // carry the auth token.
 const pinboardGet = async (url, authContext, label, clientGone = null) => {
-  const { waitMs, reservedUntil } = reservePinboardSlot(authContext.slotKey);
-  // If the client leaves while this call queues, hand its slot back straight
-  // away, so a call the user makes next doesn't queue behind it.
-  const release = () => releasePinboardSlot(authContext.slotKey, reservedUntil);
-  clientGone?.addEventListener('abort', release, { once: true });
-  if (waitMs > 0) {
-    await sleep(waitMs);
-  }
-  clientGone?.removeEventListener('abort', release);
+  const queuedAt = Date.now();
+  const slot = queuePinboardCall(authContext.slotKey);
+  // If the client leaves while this call queues, take it out of the queue
+  // straight away, so the calls behind it don't wait for nothing.
+  clientGone?.addEventListener('abort', slot.cancel, { once: true });
+  await slot.ready;
+  clientGone?.removeEventListener('abort', slot.cancel);
+  const waitMs = Date.now() - queuedAt;
   const startedAt = Date.now();
   let outcome = 'ok';
   let deadlineTimer = null;
