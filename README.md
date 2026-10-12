@@ -44,12 +44,15 @@ cp .env.example .env
 | `PREVIEW_RATE_LIMIT_MAX` | `/posts/suggest-with-preview` requests allowed per IP per minute | 20 | No |
 | `PAGE_PREVIEW_RATE_LIMIT_MAX` | `/preview` requests allowed per IP per minute | 60 | No |
 | `PINBOARD_MIN_INTERVAL_MS` | Minimum gap between the starts of two Pinboard calls for the same user (`0` turns spacing off) | 3000 | No |
-| `PINBOARD_MAX_QUEUE_MS` | Longest a call will wait for its slot; a call that would wait longer is sent straight away | 9000 | No |
+| `PINBOARD_MAX_QUEUE_MS` | Longest a call will wait for its slot; a call that would wait longer is sent straight away. Capped at the budget below minus 5 s | 9000 | No |
+| `PINBOARD_TOTAL_BUDGET_MS` | Longest a Pinboard call may take, queueing included, before the bridge answers 504 | 25000 | No |
 
-**CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` defaults to the Pincushion frontend at `https://rossshannon.github.com`:
+Numeric settings must be whole numbers; anything else (`-1`, `1e3`, `300ms`) is ignored with a warning and the default is used.
+
+**CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` defaults to the Pincushion frontend at `https://rossshannon.github.io`:
 
 ```bash
-ALLOWED_ORIGINS=https://rossshannon.github.com
+ALLOWED_ORIGINS=https://rossshannon.github.io
 ```
 
 ### Authentication Policy
@@ -79,7 +82,7 @@ ALLOWED_ORIGINS=https://rossshannon.github.com
 ```bash
 npm run dev
 # or specify env vars
-PORT=1337 ALLOWED_ORIGINS=https://rossshannon.github.com npm start
+PORT=1337 ALLOWED_ORIGINS=https://rossshannon.github.io npm start
 ```
 
 Health check:
@@ -92,7 +95,7 @@ Proxy usage example (Pinboard “all posts” endpoint using an auth token expos
 
 ```bash
 curl \
-  -H "Origin: https://rossshannon.github.com" \
+  -H "Origin: https://rossshannon.github.io" \
   -H "Authorization: Bearer username:YOURTOKEN" \
   "http://localhost:1337/v1/posts/all?format=json"
 ```
@@ -154,7 +157,8 @@ This endpoint keeps preview scraping on the server (no extra browser permissions
 
 **Limits & logging**
 
-- Preview fetches are limited to 30 requests per minute per Authorization token.
+- Preview fetches are limited to 20 requests per minute per IP on this route (`PREVIEW_RATE_LIMIT_MAX`), and 60 on `/preview`.
+- A failed preview tells the client only what kind of failure it was (`Preview fetch timed out`, `Preview response is not HTML`, `URL host is not reachable from the proxy`, `Page returned HTTP 404`, or `Could not fetch the page`). The underlying error goes to the logs only, so the route can't be used to probe what the dyno can reach.
 - Each request logs `{user, targetHost, outcome}` (`preview_generated`, `preview_not_found`, or `preview_failed`) to help spot misuse without storing the raw token, plus `suggestMs` and `previewMs`: how long each half took, as the user saw it (`suggestMs` includes any time spent waiting for the user's Pinboard slot).
 - Every Pinboard call also logs a `[pinboard]` line with the endpoint, `waitMs` (time held for the user's slot) and `upstreamMs` (time Pinboard took).
 
@@ -208,7 +212,11 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 ### Version 2.3.0
 - Add `/preview`, which returns page metadata without waiting on Pinboard's `posts/suggest`
 - Space Pinboard calls for the same user three seconds apart, per Pinboard's guidance (`PINBOARD_MIN_INTERVAL_MS`, `PINBOARD_MAX_QUEUE_MS`)
-- Read preview pages only as far as `</head>`, under one 5-second deadline for the whole fetch
+- Read preview pages only as far as `</head>` (or `<body>`, for pages that leave the closing tag out), under one 5-second deadline for the whole fetch
+- Tell clients only what kind of preview failure happened, keeping network error detail in the logs
+- Give each Pinboard call a deadline for the whole response, not just for gaps in it (`PINBOARD_TOTAL_BUDGET_MS`)
+- Ignore numeric settings that aren't whole numbers, with a warning, instead of half-parsing them
+- Correct the documented `ALLOWED_ORIGINS` for Pincushion to `https://rossshannon.github.io`
 - Harden the preview fetcher's SSRF guard: refuse hostnames that resolve to private addresses, redirects to private hosts, and `0.0.0.0/8`, `100.64.0.0/10`, reserved, benchmarking and multicast IPv4, link-local, site-local and multicast IPv6, and IPv6 forms that embed an IPv4 address (mapped, compatible, NAT64, 6to4, Teredo)
 - Hang up on a preview page once its head has been read, or as soon as it turns out to be an error or not HTML
 - Key the `/preview` and `/posts/suggest-with-preview` rate limits on the client IP, since the `Authorization` header isn't checked there

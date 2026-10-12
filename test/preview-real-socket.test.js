@@ -5,9 +5,10 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const dns = require('node:dns');
+const { Readable } = require('node:stream');
 
 process.env.PORT = '0';
-const { server: bridge, fetchPreview, addressGuard, isPrivateAddress } = require('../web.js');
+const { server: bridge, fetchPreview, readHead, addressGuard, isPrivateAddress } = require('../web.js');
 
 // Let the loopback test server through; everything else keeps the real rules.
 addressGuard.isPrivate = address => address !== '127.0.0.1' && isPrivateAddress(address);
@@ -99,14 +100,67 @@ test('stops at the byte cap when a page never closes its head', async () => {
     res.write('<html><head><title>Capped</title>');
     const filler = `<meta name="x" content="${'x'.repeat(1000)}">`;
     const pump = () => {
-      while (res.write(filler)) { /* keep the pipe full */ }
-      res.once('drain', pump);
+      while (!res.destroyed && res.write(filler)) { /* keep the pipe full */ }
+      if (!res.destroyed) res.once('drain', pump);
     };
     pump();
   };
   const preview = await fetchPreview(new URL(`${base}/no-head-end`));
   assert.equal(preview.title, 'Capped');
   assert.ok(await allClosed(), 'expected the bridge to close the connection');
+});
+
+test('reads no more than 512 KB of a head that never ends', async () => {
+  // Socket buffers make bytes sent a poor measure, so count what readHead pulls.
+  let pulled = 0;
+  const chunk = Buffer.from(`<meta name="x" content="${'x'.repeat(1000)}">`);
+  const stream = new Readable({
+    read() {
+      pulled += chunk.length;
+      this.push(chunk);
+    }
+  });
+  const body = await readHead(stream);
+  assert.ok(body.length >= 512 * 1024, `read only ${body.length} bytes`);
+  assert.ok(pulled < 512 * 1024 + 64 * 1024, `pulled ${pulled} bytes; expected to stop at 512 KB`);
+});
+
+test('treats the start of <body> as the end of a head with no </head>', async () => {
+  routes['/no-close-tag'] = (req, res) => {
+    html(res);
+    res.write('<html><head><title>Implied</title><meta property="og:description" content="No close tag"><body><p>');
+    // Never ended: the bridge must stop at <body>, not wait for the cap or the deadline.
+  };
+  const startedAt = Date.now();
+  const preview = await fetchPreview(new URL(`${base}/no-close-tag`));
+  assert.equal(preview.description, 'No close tag');
+  assert.ok(Date.now() - startedAt < 1000);
+  assert.ok(await allClosed(), 'expected the bridge to close the connection');
+});
+
+test('tells the client only that a page could not be fetched, not why', async () => {
+  // A port nothing listens on: the raw error would name the address and port.
+  const closed = http.createServer();
+  await new Promise(resolve => closed.listen(0, '127.0.0.1', resolve));
+  const { port } = closed.address();
+  await new Promise(resolve => closed.close(resolve));
+
+  const lines = [];
+  const originalInfo = console.info;
+  console.info = (...args) => { lines.push(args.join(' ')); };
+  let body;
+  try {
+    const res = await fetch(`http://127.0.0.1:${bridge.address().port}/preview?url=${encodeURIComponent(`http://preview.test:${port}/`)}`, {
+      headers: { Authorization: 'Basic ' + Buffer.from('alice:secret').toString('base64') }
+    });
+    body = await res.json();
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(body.previewError, 'Could not fetch the page');
+  assert.ok(!JSON.stringify(body).includes('ECONNREFUSED'));
+  // The detail still reaches our own logs.
+  assert.ok(lines.some(line => line.includes('ECONNREFUSED')), lines.join(' | '));
 });
 
 test('does not mistake </header> for the end of the head', async () => {

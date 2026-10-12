@@ -20,24 +20,46 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 const PINBOARD_BASE_URL = 'https://api.pinboard.in';
 const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 const PREVIEW_TIMEOUT_MS = 5000;
-// Heroku's router gives up on a request after 30 s. Queueing plus the Pinboard
-// call must finish inside this, leaving room to send the response.
-const PINBOARD_TOTAL_BUDGET_MS = 25000;
 // Everything a preview needs lives in <head>, so stop reading there. This cap
 // only applies when a page never closes its <head>.
 const PREVIEW_HEAD_MAX_BYTES = 512 * 1024;
+// Read a whole-number setting. Anything else ("-1", "1e3", "300ms") falls
+// back to the default with a warning, rather than being half-parsed.
+const parseIntSetting = (name, fallback, { min }) => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const trimmed = String(raw).trim();
+  const parsed = /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
+  if (Number.isSafeInteger(parsed) && parsed >= min) return parsed;
+  console.warn(`Ignoring ${name}=${JSON.stringify(raw)}: expected a whole number of at least ${min}. Using ${fallback}.`);
+  return fallback;
+};
+const parseNonNegativeInt = (name, fallback) => parseIntSetting(name, fallback, { min: 0 });
+const parsePositiveInt = (name, fallback) => parseIntSetting(name, fallback, { min: 1 });
 // Pinboard asks for at most one API call per user every three seconds. Calls
 // for the same user are spaced this far apart (start to start); set it to 0
 // to turn spacing off.
-const parseNonNegativeInt = (value, fallback) => {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
-};
-const PINBOARD_MIN_INTERVAL_MS = parseNonNegativeInt(process.env.PINBOARD_MIN_INTERVAL_MS, 3000);
+const PINBOARD_MIN_INTERVAL_MS = parseNonNegativeInt('PINBOARD_MIN_INTERVAL_MS', 3000);
+// Heroku's router gives up on a request after 30 s. Queueing plus the Pinboard
+// call must finish inside this, leaving room to send the response.
+const PINBOARD_TOTAL_BUDGET_MS = parsePositiveInt('PINBOARD_TOTAL_BUDGET_MS', 25000);
 // A call that would have to queue longer than this goes straight through
 // instead, so a burst degrades to unspaced calls rather than piling up
 // towards Heroku's 30s router timeout.
-const PINBOARD_MAX_QUEUE_MS = parseNonNegativeInt(process.env.PINBOARD_MAX_QUEUE_MS, 9000);
+// Capped so that queueing still leaves the Pinboard call a few seconds of
+// its budget.
+const PINBOARD_MAX_QUEUE_LIMIT_MS = Math.max(0, PINBOARD_TOTAL_BUDGET_MS - 5000);
+const PINBOARD_MAX_QUEUE_MS = (() => {
+  const value = parseNonNegativeInt('PINBOARD_MAX_QUEUE_MS', 9000);
+  if (value > PINBOARD_MAX_QUEUE_LIMIT_MS) {
+    console.warn(`PINBOARD_MAX_QUEUE_MS=${value} would run past Heroku's router timeout. Using ${PINBOARD_MAX_QUEUE_LIMIT_MS}.`);
+    return PINBOARD_MAX_QUEUE_LIMIT_MS;
+  }
+  if (PINBOARD_MIN_INTERVAL_MS > 0 && value < PINBOARD_MIN_INTERVAL_MS) {
+    console.warn(`PINBOARD_MAX_QUEUE_MS=${value} is below PINBOARD_MIN_INTERVAL_MS=${PINBOARD_MIN_INTERVAL_MS}, so no call will ever be spaced.`);
+  }
+  return value;
+})();
 // Browsers must preflight every call to this bridge (the Authorization
 // header is not CORS-safelisted). Letting them cache the preflight verdict
 // saves a full round trip on repeat requests to the same URL, e.g.
@@ -47,7 +69,7 @@ const CORS_PREFLIGHT_MAX_AGE_SECONDS = 24 * 60 * 60;
 // which works out at 300 per 15 minutes. Match that, rather than imposing a
 // tighter ceiling that a single bookmarking session can trip.
 const IP_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
-const IP_RATE_LIMIT_MAX = Number.parseInt(process.env.IP_RATE_LIMIT_MAX, 10) || 300;
+const IP_RATE_LIMIT_MAX = parsePositiveInt('IP_RATE_LIMIT_MAX', 300);
 
 // Log startup configuration
 console.log(`Starting Pinboard Bridge in ${NODE_ENV} mode`);
@@ -215,6 +237,7 @@ const pinboardGet = async (url, authContext, label, clientGone = null) => {
   clientGone?.removeEventListener('abort', release);
   const startedAt = Date.now();
   let outcome = 'ok';
+  let deadlineTimer = null;
   try {
     // The browser gave up while this call queued: don't spend a Pinboard call on nobody.
     if (clientGone?.aborted) {
@@ -225,11 +248,21 @@ const pinboardGet = async (url, authContext, label, clientGone = null) => {
     // Time spent queueing comes out of the budget, so the whole request
     // still fits inside Heroku's router timeout.
     const timeout = Math.max(1000, PINBOARD_TOTAL_BUDGET_MS - waitMs);
-    return await axios.get(url, { ...authContext.requestConfig, timeout });
+    // axios's timeout only notices a stalled socket, so a response that
+    // trickles in could run on; this deadline covers the whole call.
+    const deadline = new AbortController();
+    deadlineTimer = setTimeout(() => deadline.abort(), timeout);
+    return await axios.get(url, { ...authContext.requestConfig, timeout, signal: deadline.signal });
   } catch (error) {
+    if (axios.isCancel(error) || error.code === 'ERR_CANCELED') {
+      // Report it the way axios reports its own timeout, which the routes map to a 504.
+      error.code = 'ECONNABORTED';
+      error.message = 'Pinboard call ran past its time budget';
+    }
     outcome = error.response?.status ? String(error.response.status) : (error.code || 'error');
     throw error;
   } finally {
+    clearTimeout(deadlineTimer);
     console.info(`[pinboard] user=${authContext.identity} call=${label} waitMs=${waitMs} upstreamMs=${Date.now() - startedAt} outcome=${outcome}`);
   }
 };
@@ -591,7 +624,8 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
 };
 
 // </head> with optional whitespace before the >; not </header> or </headline>.
-const HEAD_CLOSE = /<\/head\s*>/;
+// HTML lets a page leave </head> out, so the start of <body> also ends it.
+const HEAD_CLOSE = /<\/head\s*>|<body[\s>]/;
 const HEAD_CLOSE_CARRY = 32;
 
 // Read a streamed response until </head> (or the byte cap) and drop the rest
@@ -704,6 +738,16 @@ const parsePreviewTarget = (req, res) => {
 };
 
 // Turn a settled preview fetch into the fields both preview routes return.
+// The few things a client is told about a failed preview.
+const clientPreviewError = error => {
+  const message = error?.message || '';
+  if (/timed out/i.test(message)) return 'Preview fetch timed out';
+  if (/not HTML/i.test(message)) return 'Preview response is not HTML';
+  if (/not reachable from the proxy/i.test(message)) return 'URL host is not reachable from the proxy';
+  if (error?.response?.status) return `Page returned HTTP ${error.response.status}`;
+  return 'Could not fetch the page';
+};
+
 const summarisePreview = result => {
   if (result.status === 'fulfilled') {
     const preview = result.value.value;
@@ -717,7 +761,11 @@ const summarisePreview = result => {
   return {
     preview: null,
     previewStatus: 'error',
-    previewError: result.reason?.message || 'Failed to fetch preview metadata',
+    previewError: clientPreviewError(result.reason),
+    // The raw reason is for our logs only: sent to the client, a network
+    // error ("connect ECONNREFUSED 10.0.0.5:6379") would let anyone probe
+    // what the dyno can and can't reach.
+    previewErrorDetail: JSON.stringify(String(result.reason?.message || 'unknown')),
     previewMs: result.reason?.elapsedMs ?? null
   };
 };
@@ -728,7 +776,7 @@ const previewOutcome = ({ preview, previewError }) =>
 // Pinboard's published policy is one call per user per 3 seconds, so 20/min
 // is the maximum sustained rate their /posts/suggest endpoint will accept
 // before rate-limiting drops requests (observed as silent TCP hang-ups).
-const PREVIEW_RATE_LIMIT_MAX = Number.parseInt(process.env.PREVIEW_RATE_LIMIT_MAX, 10) || 20;
+const PREVIEW_RATE_LIMIT_MAX = parsePositiveInt('PREVIEW_RATE_LIMIT_MAX', 20);
 const suggestWithPreviewRateLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: PREVIEW_RATE_LIMIT_MAX,
@@ -741,7 +789,7 @@ const suggestWithPreviewRateLimiter = rateLimit({
 });
 
 // /preview never calls Pinboard, so it only needs a guard against scraping.
-const PAGE_PREVIEW_RATE_LIMIT_MAX = Number.parseInt(process.env.PAGE_PREVIEW_RATE_LIMIT_MAX, 10) || 60;
+const PAGE_PREVIEW_RATE_LIMIT_MAX = parsePositiveInt('PAGE_PREVIEW_RATE_LIMIT_MAX', 60);
 const pagePreviewRateLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: PAGE_PREVIEW_RATE_LIMIT_MAX,
@@ -782,14 +830,14 @@ app.get('/preview', limiter, pagePreviewRateLimiter, async (req, res) => {
     } catch (reason) {
       previewResult = { status: 'rejected', reason };
     }
-    const { preview, previewStatus, previewError, previewMs } = summarisePreview(previewResult);
+    const { preview, previewStatus, previewError, previewErrorDetail, previewMs } = summarisePreview(previewResult);
 
     const payload = { preview, previewStatus };
     if (previewError) {
       payload.previewError = previewError;
     }
 
-    console.info(`[preview] route=preview user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${previewOutcome({ preview, previewError })} previewMs=${previewMs}` + (previewError ? ` previewError="${previewError}"` : ''));
+    console.info(`[preview] route=preview user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${previewOutcome({ preview, previewError })} previewMs=${previewMs}` + (previewError ? ` previewError=${previewErrorDetail}` : ''));
 
     return res.json(payload);
   } catch (error) {
@@ -861,7 +909,7 @@ app.get('/posts/suggest-with-preview', limiter, suggestWithPreviewRateLimiter, a
       suggestMs = suggestionsResult.value.ms;
     }
 
-    const { preview, previewStatus, previewError, previewMs } = summarisePreview(previewResult);
+    const { preview, previewStatus, previewError, previewErrorDetail, previewMs } = summarisePreview(previewResult);
 
     const payload = {
       suggestions,
@@ -877,7 +925,7 @@ app.get('/posts/suggest-with-preview', limiter, suggestWithPreviewRateLimiter, a
       payload.previewError = previewError;
     }
 
-    console.info(`[preview] route=suggest-with-preview user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${previewOutcome({ preview, previewError })} suggestions=${suggestionsStatus} suggestMs=${suggestMs} previewMs=${previewMs}` + (previewError ? ` previewError="${previewError}"` : '') + (suggestionsError ? ` suggestionsError="${suggestionsError}"` : ''));
+    console.info(`[preview] route=suggest-with-preview user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${previewOutcome({ preview, previewError })} suggestions=${suggestionsStatus} suggestMs=${suggestMs} previewMs=${previewMs}` + (previewError ? ` previewError=${previewErrorDetail}` : '') + (suggestionsError ? ` suggestionsError="${suggestionsError}"` : ''));
 
     return res.json(payload);
   } catch (error) {
@@ -986,4 +1034,4 @@ const shutdown = () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-module.exports = { app, server, isPrivateAddress, isPrivateHostname, guardRedirect, fetchPreview, addressGuard };
+module.exports = { app, server, parseIntSetting, isPrivateAddress, isPrivateHostname, guardRedirect, fetchPreview, readHead, addressGuard };
