@@ -640,8 +640,8 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-// Last-resort error handler, so an error thrown after the CORS handler above
-// (say, from the rate limiter's store) still gets a JSON body.
+// The same handler again, for errors raised after the first mount: the rate
+// limiter's store, routing (a malformed path), or a route itself.
 app.use(jsonErrorHandler);
 
 // Start server
