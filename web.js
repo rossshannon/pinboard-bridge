@@ -3,6 +3,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const helmet = require('helmet');
 const cors = require('cors');
 const compression = require('compression');
@@ -18,6 +19,21 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 const PINBOARD_BASE_URL = 'https://api.pinboard.in';
 const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 const PREVIEW_TIMEOUT_MS = 5000;
+// Everything a preview needs lives in <head>, so stop reading there. This cap
+// only applies when a page never closes its <head>.
+const PREVIEW_HEAD_MAX_BYTES = 512 * 1024;
+// Pinboard asks for at most one API call per user every three seconds. Calls
+// for the same user are spaced this far apart (start to start); set it to 0
+// to turn spacing off.
+const parseNonNegativeInt = (value, fallback) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+const PINBOARD_MIN_INTERVAL_MS = parseNonNegativeInt(process.env.PINBOARD_MIN_INTERVAL_MS, 3000);
+// A call that would have to queue longer than this goes straight through
+// instead, so a burst degrades to unspaced calls rather than piling up
+// towards Heroku's 30s router timeout.
+const PINBOARD_MAX_QUEUE_MS = parseNonNegativeInt(process.env.PINBOARD_MAX_QUEUE_MS, 9000);
 // Browsers must preflight every call to this bridge (the Authorization
 // header is not CORS-safelisted). Letting them cache the preflight verdict
 // saves a full round trip on repeat requests to the same URL, e.g.
@@ -122,9 +138,14 @@ const xmlParser = new XMLParser({
 
 const USER_AGENT = 'pinboard-bridge/2.0 (+https://github.com/rossshannon/pinboard-bridge)';
 
+// Reuse TLS connections to api.pinboard.in rather than paying a fresh
+// handshake on every call.
+const pinboardAgent = new https.Agent({ keepAlive: true, maxSockets: 32 });
+
 // Axios configuration with timeout
 const apiRequestDefaults = {
   timeout: 30000, // 30 seconds timeout
+  httpsAgent: pinboardAgent,
   headers: {
     'User-Agent': USER_AGENT
   }
@@ -135,12 +156,66 @@ const previewRequestConfig = {
   maxRedirects: 3,
   maxContentLength: PREVIEW_MAX_BYTES,
   maxBodyLength: PREVIEW_MAX_BYTES,
-  responseType: 'arraybuffer',
+  responseType: 'stream',
   headers: {
     Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
     'User-Agent': USER_AGENT
   },
   validateStatus: status => status >= 200 && status < 400,
+};
+
+// Per-user spacing of Pinboard calls. Each user has a next free slot; a call
+// takes the later of now and that slot, and pushes the slot one interval on.
+const pinboardNextSlotAt = new Map();
+
+const reservePinboardSlot = identity => {
+  if (PINBOARD_MIN_INTERVAL_MS === 0) return 0;
+  const key = String(identity || '').toLowerCase();
+  const now = Date.now();
+  if (pinboardNextSlotAt.size > 1000) {
+    for (const [user, slotAt] of pinboardNextSlotAt) {
+      if (slotAt < now) pinboardNextSlotAt.delete(user);
+    }
+  }
+  const slotAt = Math.max(now, pinboardNextSlotAt.get(key) || 0);
+  const waitMs = slotAt - now;
+  if (waitMs > PINBOARD_MAX_QUEUE_MS) {
+    return 0;
+  }
+  pinboardNextSlotAt.set(key, slotAt + PINBOARD_MIN_INTERVAL_MS);
+  return waitMs;
+};
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// GET a Pinboard API URL on behalf of a user, spaced per user, and log how
+// long it queued and how long Pinboard took. The URL is not logged: it can
+// carry the auth token.
+const pinboardGet = async (url, authContext, label) => {
+  const waitMs = reservePinboardSlot(authContext.identity);
+  if (waitMs > 0) {
+    await sleep(waitMs);
+  }
+  const startedAt = Date.now();
+  let outcome = 'ok';
+  try {
+    return await axios.get(url, authContext.requestConfig);
+  } catch (error) {
+    outcome = error.response?.status ? String(error.response.status) : (error.code || 'error');
+    throw error;
+  } finally {
+    console.info(`[pinboard] user=${authContext.identity} call=${label} waitMs=${waitMs} upstreamMs=${Date.now() - startedAt} outcome=${outcome}`);
+  }
+};
+
+const timed = async promise => {
+  const startedAt = Date.now();
+  try {
+    return { value: await promise, ms: Date.now() - startedAt };
+  } catch (error) {
+    error.elapsedMs = Date.now() - startedAt;
+    throw error;
+  }
 };
 
 const buildSearchParams = query => {
@@ -381,28 +456,146 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
   };
 };
 
+const HEAD_CLOSE = '</head';
+
+// Read a streamed response until </head> (or the byte cap) and drop the rest
+// of the page. Non-stream bodies (strings, buffers) are returned as they are.
+const readHead = async data => {
+  if (typeof data === 'string') return data;
+  if (Buffer.isBuffer(data)) return data.toString('utf8');
+  if (!data || typeof data.on !== 'function') return String(data || '');
+
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let length = 0;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      data.destroy();
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    };
+    data.on('data', chunk => {
+      // Search from a little before this chunk so a tag split across two
+      // chunks is still found.
+      const searchFrom = Math.max(0, length - HEAD_CLOSE.length);
+      chunks.push(chunk);
+      length += chunk.length;
+      const tail = Buffer.concat(chunks).subarray(searchFrom).toString('latin1').toLowerCase();
+      if (tail.includes(HEAD_CLOSE) || length >= PREVIEW_HEAD_MAX_BYTES) {
+        finish();
+      }
+    });
+    data.on('end', finish);
+    data.on('error', err => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+  });
+};
+
 const fetchPreview = async targetUrl => {
-  const response = await axios.get(targetUrl.toString(), previewRequestConfig);
-  const finalUrl = response.request?.res?.responseUrl || targetUrl.toString();
-  const contentType = response.headers['content-type'] || '';
-  if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
-    throw new Error('Preview response is not HTML');
+  // One deadline for the whole fetch (redirects and body included), not just
+  // for each socket going quiet.
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), PREVIEW_TIMEOUT_MS);
+  try {
+    const response = await axios.get(targetUrl.toString(), {
+      ...previewRequestConfig,
+      signal: controller.signal
+    });
+    const finalUrl = response.request?.res?.responseUrl || targetUrl.toString();
+    const contentType = response.headers['content-type'] || '';
+    if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+      if (response.data && typeof response.data.destroy === 'function') {
+        response.data.destroy();
+      }
+      throw new Error('Preview response is not HTML');
+    }
+
+    const body = await readHead(response.data);
+    return extractPreviewMetadata(body, finalUrl, targetUrl.toString());
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`Preview fetch timed out after ${PREVIEW_TIMEOUT_MS}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(deadline);
+  }
+};
+
+// Validate the ?url= target shared by the preview routes. Returns the parsed
+// URL, or sends a 400 and returns null.
+const parsePreviewTarget = (req, res) => {
+  const target = Array.isArray(req.query.url) ? req.query.url[0] : req.query.url;
+  if (!target) {
+    res.status(400).json({ error: 'url query parameter is required' });
+    return null;
   }
 
-  const body = Buffer.isBuffer(response.data)
-    ? response.data.toString('utf8')
-    : response.data;
+  let normalizedUrl;
+  try {
+    normalizedUrl = new URL(target);
+  } catch (err) {
+    res.status(400).json({ error: 'Invalid url parameter' });
+    return null;
+  }
 
-  return extractPreviewMetadata(body, finalUrl, targetUrl.toString());
+  if (!['http:', 'https:'].includes(normalizedUrl.protocol)) {
+    res.status(400).json({ error: 'URL must use http or https' });
+    return null;
+  }
+
+  if (isPrivateHostname(normalizedUrl.hostname)) {
+    res.status(400).json({ error: 'URL host is not reachable from the proxy' });
+    return null;
+  }
+
+  return normalizedUrl;
 };
+
+// Turn a settled preview fetch into the fields both preview routes return.
+const summarisePreview = result => {
+  if (result.status === 'fulfilled') {
+    const preview = result.value.value;
+    return {
+      preview,
+      previewStatus: preview ? (preview.status || 'fresh') : 'no_data',
+      previewError: null,
+      previewMs: result.value.ms
+    };
+  }
+  return {
+    preview: null,
+    previewStatus: 'error',
+    previewError: result.reason?.message || 'Failed to fetch preview metadata',
+    previewMs: result.reason?.elapsedMs ?? null
+  };
+};
+
+const previewOutcome = ({ preview, previewError }) =>
+  preview ? 'preview_generated' : (previewError ? 'preview_failed' : 'preview_not_found');
 
 // Pinboard's published policy is one call per user per 3 seconds, so 20/min
 // is the maximum sustained rate their /posts/suggest endpoint will accept
 // before rate-limiting drops requests (observed as silent TCP hang-ups).
 const PREVIEW_RATE_LIMIT_MAX = Number.parseInt(process.env.PREVIEW_RATE_LIMIT_MAX, 10) || 20;
-const previewRateLimiter = rateLimit({
+const suggestWithPreviewRateLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: PREVIEW_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many preview requests, please slow down.' },
+  keyGenerator: req => req.headers['authorization'] || req.ip,
+});
+
+// /preview never calls Pinboard, so it only needs a guard against scraping.
+const PAGE_PREVIEW_RATE_LIMIT_MAX = Number.parseInt(process.env.PAGE_PREVIEW_RATE_LIMIT_MAX, 10) || 60;
+const pagePreviewRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: PAGE_PREVIEW_RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many preview requests, please slow down.' },
@@ -418,28 +611,44 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Suggest with preview endpoint
-app.get('/posts/suggest-with-preview', previewRateLimiter, async (req, res) => {
+// Page preview on its own: no Pinboard call, so it returns as soon as the
+// page has been read, however slow Pinboard's suggest is.
+app.get('/preview', pagePreviewRateLimiter, async (req, res) => {
   try {
-    const target = Array.isArray(req.query.url) ? req.query.url[0] : req.query.url;
-    if (!target) {
-      return res.status(400).json({ error: 'url query parameter is required' });
-    }
+    const normalizedUrl = parsePreviewTarget(req, res);
+    if (!normalizedUrl) return;
 
-    let normalizedUrl;
+    let authContext;
     try {
-      normalizedUrl = new URL(target);
+      authContext = applyAuthContext(req, null);
     } catch (err) {
-      return res.status(400).json({ error: 'Invalid url parameter' });
+      return res.status(401).json({ error: err.message });
     }
 
-    if (!['http:', 'https:'].includes(normalizedUrl.protocol)) {
-      return res.status(400).json({ error: 'URL must use http or https' });
+    const [previewResult] = await Promise.allSettled([timed(fetchPreview(normalizedUrl))]);
+    const { preview, previewStatus, previewError, previewMs } = summarisePreview(previewResult);
+
+    const payload = { preview, previewStatus };
+    if (previewError) {
+      payload.previewError = previewError;
     }
 
-    if (isPrivateHostname(normalizedUrl.hostname)) {
-      return res.status(400).json({ error: 'URL host is not reachable from the proxy' });
-    }
+    console.info(`[preview] route=preview user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${previewOutcome({ preview, previewError })} previewMs=${previewMs}` + (previewError ? ` previewError="${previewError}"` : ''));
+
+    return res.json(payload);
+  } catch (error) {
+    console.error('Preview handler error:', error.message);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Suggest with preview endpoint. Kept for older clients; it answers only once
+// both halves are done, so newer clients call /preview and /v1/posts/suggest
+// separately.
+app.get('/posts/suggest-with-preview', suggestWithPreviewRateLimiter, async (req, res) => {
+  try {
+    const normalizedUrl = parsePreviewTarget(req, res);
+    if (!normalizedUrl) return;
 
     const pinboardParams = new URLSearchParams();
     pinboardParams.set('url', normalizedUrl.toString());
@@ -453,8 +662,8 @@ app.get('/posts/suggest-with-preview', previewRateLimiter, async (req, res) => {
     }
 
     const pinboardUrl = `${PINBOARD_BASE_URL}/v1/posts/suggest?${pinboardParams.toString()}`;
-    const suggestionsPromise = axios.get(pinboardUrl, authContext.requestConfig);
-    const previewPromise = fetchPreview(normalizedUrl);
+    const suggestionsPromise = timed(pinboardGet(pinboardUrl, authContext, 'posts/suggest'));
+    const previewPromise = timed(fetchPreview(normalizedUrl));
 
     const [suggestionsResult, previewResult] = await Promise.allSettled([suggestionsPromise, previewPromise]);
 
@@ -465,10 +674,12 @@ app.get('/posts/suggest-with-preview', previewRateLimiter, async (req, res) => {
     let suggestions = null;
     let suggestionsError = null;
     let suggestionsStatus = 'ok';
+    let suggestMs = null;
 
     if (suggestionsResult.status === 'rejected') {
       const error = suggestionsResult.reason;
       const upstreamStatus = error.response?.status;
+      suggestMs = error.elapsedMs ?? null;
 
       if (upstreamStatus && SUGGEST_HARD_FAIL_STATUSES.has(upstreamStatus)) {
         const message = typeof error.response.data === 'string'
@@ -487,19 +698,11 @@ app.get('/posts/suggest-with-preview', previewRateLimiter, async (req, res) => {
       }
       console.error('Pinboard suggest error:', error.message);
     } else {
-      suggestions = suggestionsResult.value.data;
+      suggestions = suggestionsResult.value.value.data;
+      suggestMs = suggestionsResult.value.ms;
     }
 
-    let preview = null;
-    let previewError = null;
-    let previewStatus = 'none';
-    if (previewResult.status === 'fulfilled') {
-      preview = previewResult.value;
-      previewStatus = preview ? (preview.status || 'fresh') : 'no_data';
-    } else {
-      previewError = previewResult.reason?.message || 'Failed to fetch preview metadata';
-      previewStatus = 'error';
-    }
+    const { preview, previewStatus, previewError, previewMs } = summarisePreview(previewResult);
 
     const payload = {
       suggestions,
@@ -515,8 +718,7 @@ app.get('/posts/suggest-with-preview', previewRateLimiter, async (req, res) => {
       payload.previewError = previewError;
     }
 
-    const outcome = preview ? 'preview_generated' : (previewError ? 'preview_failed' : 'preview_not_found');
-    console.info(`[preview] user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${outcome} suggestions=${suggestionsStatus}` + (previewError ? ` previewError="${previewError}"` : '') + (suggestionsError ? ` suggestionsError="${suggestionsError}"` : ''));
+    console.info(`[preview] route=suggest-with-preview user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${previewOutcome({ preview, previewError })} suggestions=${suggestionsStatus} suggestMs=${suggestMs} previewMs=${previewMs}` + (previewError ? ` previewError="${previewError}"` : '') + (suggestionsError ? ` suggestionsError="${suggestionsError}"` : ''));
 
     return res.json(payload);
   } catch (error) {
@@ -545,7 +747,7 @@ app.get('/v1/*', async (req, res) => {
     }
 
     // Make request to Pinboard API
-    const response = await axios.get(url, authContext.requestConfig);
+    const response = await pinboardGet(url, authContext, path.replace(/^\/v1\//, ''));
     const { data, status } = response;
 
     if (status !== 200) {
