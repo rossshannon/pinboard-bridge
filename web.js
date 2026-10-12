@@ -144,7 +144,7 @@ const USER_AGENT = 'pinboard-bridge/2.0 (+https://github.com/rossshannon/pinboar
 
 // Axios configuration with timeout
 const apiRequestDefaults = {
-  timeout: 30000, // 30 seconds timeout
+  timeout: PINBOARD_TOTAL_BUDGET_MS, // pinboardGet trims this by time spent queueing
   headers: {
     'User-Agent': USER_AGENT
   }
@@ -171,7 +171,7 @@ const pinboardNextSlotAt = new Map();
 let lastSlotSweepAt = 0;
 
 const reservePinboardSlot = slotKey => {
-  if (PINBOARD_MIN_INTERVAL_MS === 0) return 0;
+  if (PINBOARD_MIN_INTERVAL_MS === 0) return { waitMs: 0, reservedUntil: null };
   const key = slotKey;
   const now = Date.now();
   if (pinboardNextSlotAt.size > 1000 && now - lastSlotSweepAt > 1000) {
@@ -183,10 +183,19 @@ const reservePinboardSlot = slotKey => {
   const slotAt = Math.max(now, pinboardNextSlotAt.get(key) || 0);
   const waitMs = slotAt - now;
   if (waitMs > PINBOARD_MAX_QUEUE_MS) {
-    return 0;
+    return { waitMs: 0, reservedUntil: null };
   }
-  pinboardNextSlotAt.set(key, slotAt + PINBOARD_MIN_INTERVAL_MS);
-  return waitMs;
+  const reservedUntil = slotAt + PINBOARD_MIN_INTERVAL_MS;
+  pinboardNextSlotAt.set(key, reservedUntil);
+  return { waitMs, reservedUntil };
+};
+
+// Give back a slot whose call was never made, if no later call has queued
+// behind it, so the user's next call doesn't wait for nothing.
+const releasePinboardSlot = (slotKey, reservedUntil) => {
+  if (reservedUntil !== null && pinboardNextSlotAt.get(slotKey) === reservedUntil) {
+    pinboardNextSlotAt.set(slotKey, reservedUntil - PINBOARD_MIN_INTERVAL_MS);
+  }
 };
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -195,10 +204,15 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 // long it queued and how long Pinboard took. The URL is not logged: it can
 // carry the auth token.
 const pinboardGet = async (url, authContext, label, clientGone = null) => {
-  const waitMs = reservePinboardSlot(authContext.slotKey);
+  const { waitMs, reservedUntil } = reservePinboardSlot(authContext.slotKey);
+  // If the client leaves while this call queues, hand its slot back straight
+  // away, so a call the user makes next doesn't queue behind it.
+  const release = () => releasePinboardSlot(authContext.slotKey, reservedUntil);
+  clientGone?.addEventListener('abort', release, { once: true });
   if (waitMs > 0) {
     await sleep(waitMs);
   }
+  clientGone?.removeEventListener('abort', release);
   const startedAt = Date.now();
   let outcome = 'ok';
   try {
@@ -805,6 +819,9 @@ app.get('/posts/suggest-with-preview', limiter, suggestWithPreviewRateLimiter, a
     const previewPromise = timed(fetchPreview(normalizedUrl));
 
     const [suggestionsResult, previewResult] = await Promise.allSettled([suggestionsPromise, previewPromise]);
+    if (suggestionsResult.status === 'rejected' && suggestionsResult.reason.code === 'ECLIENTGONE') {
+      return; // the client left while its call was queued
+    }
 
     // Auth failures from Pinboard must surface to the caller. Everything else
     // degrades gracefully so a flaky Pinboard doesn't also wipe out the preview.
@@ -907,6 +924,9 @@ app.get('/v1/*', async (req, res) => {
       return res.status(500).json({ error: 'Failed to parse XML response' });
     }
   } catch (error) {
+    // The client left while its call was queued: nobody to answer.
+    if (error.code === 'ECLIENTGONE') return;
+
     // Handle Axios errors
     if (error.response) {
       const status = error.response.status;

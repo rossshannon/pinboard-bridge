@@ -254,3 +254,25 @@ test('a queued call is dropped if the client has gone by its turn', async () => 
   assert.equal(calls.filter(c => c.url.includes('api.pinboard.in')).length, 1);
 });
 
+
+test('a dropped call gives its slot back to the next one', async () => {
+  const startedAt = Date.now();
+  const first = call('/v1/posts/get?format=json&url=1');
+  const controller = new AbortController();
+  const dropped = fetch(`${baseUrl()}/v1/posts/get?format=json&url=2`, {
+    headers: { Authorization: basic('alice') },
+    signal: controller.signal
+  }).catch(() => null);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  controller.abort();
+  await Promise.all([first, dropped]);
+  // Give the bridge a moment to see the disconnect.
+  await new Promise(resolve => setTimeout(resolve, 50));
+  await call('/v1/posts/get?format=json&url=3');
+
+  const offsets = calls.filter(c => c.url.includes('api.pinboard.in')).map(c => c.at - startedAt);
+  assert.equal(offsets.length, 2);
+  // The third call takes the dropped call's slot (~300ms). Without the
+  // release it would face a 600ms slot, over the 500ms cap, and skip the queue.
+  assert.ok(offsets[1] >= 280 && offsets[1] < 500, `expected the next call at ~300ms, got ${offsets[1]}ms`);
+});

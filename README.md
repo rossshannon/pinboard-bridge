@@ -210,10 +210,10 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - Space Pinboard calls for the same user three seconds apart, per Pinboard's guidance (`PINBOARD_MIN_INTERVAL_MS`, `PINBOARD_MAX_QUEUE_MS`)
 - Read preview pages only as far as `</head>`, under one 5-second deadline for the whole fetch
 - Harden the preview fetcher's SSRF guard: refuse hostnames that resolve to private addresses, redirects to private hosts, and `0.0.0.0/8`, `100.64.0.0/10`, reserved, benchmarking and multicast IPv4, link-local, site-local and multicast IPv6, and IPv6 forms that embed an IPv4 address (mapped, compatible, NAT64, 6to4, Teredo)
-- Close the connection to a preview page once it has been read, including when it turned out not to be HTML
+- Hang up on a preview page once its head has been read or it turns out not to be HTML
 - Only return http(s) links in previews; resolve relative links and take the site domain from the page actually fetched
 - Log how long Pinboard and the preview fetch each took, with usernames stripped of characters that could forge log lines
-- Drop a queued Pinboard call if the client has already disconnected, and cap queueing plus the Pinboard call at 25 seconds
+- Drop a queued Pinboard call if the client has already disconnected (giving its slot to the next call), and cap queueing plus the Pinboard call at 25 seconds
 
 ### Version 2.2.0
 - Move to the Heroku-26 stack (Ubuntu 26.04, supported until April 2031); `heroku.yml` and the new `app.json` both declare `heroku-26`
