@@ -102,15 +102,26 @@ app.use(cors(corsOptions));
 // Respond immediately to CORS preflight checks
 app.options('*', cors(corsOptions));
 
-// Surface CORS rejections as JSON 403 errors
-app.use((err, req, res, next) => {
+// Turn any error into a JSON response: CORS rejections become 403, client
+// errors Express flags itself (such as a malformed percent-encoded path) keep
+// their 4xx status, and everything else is a 500. Mounted twice, here and
+// after the routes, so nothing falls through to Express's HTML error page.
+const jsonErrorHandler = (err, req, res, next) => {
+  if (res.headersSent) {
+    return next(err);
+  }
   if (err.message === 'Not allowed by CORS') {
     return res.status(403).json({ error: 'Origin not allowed by CORS policy' });
   }
-
-  console.error('Middleware error:', err.message);
+  const status = err.status || err.statusCode;
+  if (status >= 400 && status < 500) {
+    return res.status(status).json({ error: 'Bad request' });
+  }
+  console.error('Unhandled error:', err.message);
   return res.status(500).json({ error: 'Internal server error' });
-});
+};
+
+app.use(jsonErrorHandler);
 
 // Rate limiting per IP for the generic proxy routes. This sits after cors()
 // so a 429 still carries Access-Control-Allow-Origin; mounted before it, a
@@ -141,13 +152,14 @@ const USER_AGENT = 'pinboard-bridge/2.0 (+https://github.com/rossshannon/pinboar
 
 // Errors that mean the request never got an HTTP answer from Pinboard: DNS
 // (including the transient EAI_AGAIN), no route, refused, or a dropped
-// socket. These are reported as 503 rather than a generic 500.
+// socket. These are reported as 503 rather than a generic 500. A socket-level
+// ETIMEDOUT is a timeout like axios's own ECONNABORTED, so both get 504.
+const UPSTREAM_TIMEOUT_CODES = new Set(['ECONNABORTED', 'ETIMEDOUT']);
 const UPSTREAM_UNREACHABLE_CODES = new Set([
   'ENOTFOUND',
   'EAI_AGAIN',
   'ECONNREFUSED',
   'ECONNRESET',
-  'ETIMEDOUT',
   'EHOSTUNREACH',
   'ENETUNREACH',
 ]);
@@ -510,7 +522,7 @@ app.get('/posts/suggest-with-preview', previewRateLimiter, async (req, res) => {
       suggestionsStatus = 'error';
       if (upstreamStatus) {
         suggestionsError = `Pinboard suggest returned ${upstreamStatus}`;
-      } else if (error.code === 'ECONNABORTED') {
+      } else if (UPSTREAM_TIMEOUT_CODES.has(error.code)) {
         suggestionsError = 'Pinboard suggest timed out';
       } else {
         suggestionsError = error.message || 'Pinboard suggest failed';
@@ -606,7 +618,7 @@ app.get('/v1/*', async (req, res) => {
     }
 
     // Handle timeout errors
-    if (error.code === 'ECONNABORTED') {
+    if (UPSTREAM_TIMEOUT_CODES.has(error.code)) {
       console.error('Request timeout:', error.message);
       return res.status(504).json({ error: 'Gateway timeout' });
     }
@@ -627,6 +639,10 @@ app.get('/v1/*', async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
+
+// Last-resort error handler, so an error thrown after the CORS handler above
+// (say, from the rate limiter's store) still gets a JSON body.
+app.use(jsonErrorHandler);
 
 // Start server
 server.listen(PORT, () => {

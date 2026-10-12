@@ -194,7 +194,8 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 
 ### Version 2.2.1
 - Mount the per-IP limiter after CORS, so a 429 carries `Access-Control-Allow-Origin` and browsers can read it instead of seeing a network error; expose the `RateLimit-*` and `Retry-After` headers to browser clients
-- Report `EAI_AGAIN`, `EHOSTUNREACH` and `ENETUNREACH` from Pinboard as 503 alongside the other network-layer failures
+- Report `EAI_AGAIN`, `EHOSTUNREACH` and `ENETUNREACH` from Pinboard as 503 alongside the other network-layer failures, and a socket-level `ETIMEDOUT` as 504 like the existing request timeout
+- Add a final JSON error handler, so an error after the CORS check (for example from the rate limiter) never returns Express's HTML error page
 - Correct the documented `ALLOWED_ORIGINS` to Pincushion's real origin, `https://rossshannon.github.io` (it said `.github.com`, which blocks Pincushion), and set it in `app.json`
 - Reject non-integer or non-positive `IP_RATE_LIMIT_MAX`/`PREVIEW_RATE_LIMIT_MAX` with a startup warning instead of misreading them
 

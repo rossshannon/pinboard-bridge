@@ -29,6 +29,8 @@ after(() => {
   server.close();
 });
 
+const EXPOSED = 'RateLimit-Policy,RateLimit-Limit,RateLimit-Remaining,RateLimit-Reset,Retry-After';
+
 const call = () => fetch(`http://127.0.0.1:${server.address().port}/v1/tags/get?format=json`, {
   headers: {
     'Origin': 'https://allowed.example.com',
@@ -36,19 +38,29 @@ const call = () => fetch(`http://127.0.0.1:${server.address().port}/v1/tags/get?
   }
 });
 
+test('a request from a disallowed origin is refused before it uses any quota', async () => {
+  const refused = await fetch(`http://127.0.0.1:${server.address().port}/v1/tags/get?format=json`, {
+    headers: {
+      'Origin': 'https://evil.example.com',
+      'Authorization': 'Bearer testuser:DEADBEEF12345678'
+    }
+  });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.headers.get('ratelimit-remaining'), null);
+});
+
 test('a throttled /v1 response still carries CORS headers so the browser can read it', async () => {
   const first = await call();
   assert.equal(first.status, 200);
-  const exposed = (first.headers.get('access-control-expose-headers') || '').toLowerCase();
-  assert.ok(exposed.includes('ratelimit-remaining'), `expected RateLimit-Remaining to be exposed, got "${exposed}"`);
-  assert.ok(exposed.includes('retry-after'));
+  assert.equal(first.headers.get('access-control-expose-headers'), EXPOSED);
 
-  await call();
+  // Two real requests fit the limit of 2, which also shows the refused
+  // cross-origin request in the previous test used none of it.
+  assert.equal((await call()).status, 200);
   const throttled = await call();
   assert.equal(throttled.status, 429);
   assert.equal(throttled.headers.get('access-control-allow-origin'), 'https://allowed.example.com');
-  const exposedOn429 = (throttled.headers.get('access-control-expose-headers') || '').toLowerCase();
-  assert.ok(exposedOn429.includes('retry-after'));
+  assert.equal(throttled.headers.get('access-control-expose-headers'), EXPOSED);
   assert.ok(throttled.headers.get('retry-after'), 'expected Retry-After on the 429');
   assert.ok(throttled.headers.get('ratelimit-reset'), 'expected RateLimit-Reset on the 429');
   const body = await throttled.json();

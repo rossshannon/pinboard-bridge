@@ -232,6 +232,41 @@ test('returns 503 on a transient DNS failure (EAI_AGAIN)', async () => {
   assert.match(body.error, /unreachable/i);
 });
 
+test('returns 503 when there is no route to Pinboard (EHOSTUNREACH)', async () => {
+  mocks.upstream = { kind: 'network-error', message: 'connect EHOSTUNREACH 1.2.3.4:443', code: 'EHOSTUNREACH' };
+
+  const res = await call('/v1/tags/get?format=json');
+  const body = await res.json();
+  assert.equal(res.status, 503);
+  assert.match(body.error, /unreachable/i);
+});
+
+test('returns 503 when there is no route to Pinboard (ENETUNREACH)', async () => {
+  mocks.upstream = { kind: 'network-error', message: 'connect ENETUNREACH 1.2.3.4:443', code: 'ENETUNREACH' };
+
+  const res = await call('/v1/tags/get?format=json');
+  const body = await res.json();
+  assert.equal(res.status, 503);
+  assert.match(body.error, /unreachable/i);
+});
+
+test('returns 504 on a socket-level timeout (ETIMEDOUT), like an axios timeout', async () => {
+  mocks.upstream = { kind: 'network-error', message: 'connect ETIMEDOUT 1.2.3.4:443', code: 'ETIMEDOUT' };
+
+  const res = await call('/v1/tags/get?format=json');
+  const body = await res.json();
+  assert.equal(res.status, 504);
+  assert.match(body.error, /timeout/i);
+});
+
+test('a malformed path gets a JSON 400, not Express\'s HTML error page', async () => {
+  const res = await call('/v1/posts/%E0%A4%A');
+  assert.equal(res.status, 400);
+  assert.match(res.headers.get('content-type') || '', /application\/json/);
+  const body = await res.json();
+  assert.equal(body.error, 'Bad request');
+});
+
 test('returns 500 on an upstream error with no response and an unrecognised code', async () => {
   mocks.upstream = { kind: 'network-error', message: 'unexpected TLS failure', code: 'EPROTO' };
 
