@@ -223,6 +223,24 @@ test('returns 503 on DNS failure (ENOTFOUND)', async () => {
   assert.match(body.error, /unreachable/i);
 });
 
+test('returns 503 on a transient DNS failure (EAI_AGAIN)', async () => {
+  mocks.upstream = { kind: 'network-error', message: 'getaddrinfo EAI_AGAIN api.pinboard.in', code: 'EAI_AGAIN' };
+
+  const res = await call('/v1/tags/get?format=json');
+  const body = await res.json();
+  assert.equal(res.status, 503);
+  assert.match(body.error, /unreachable/i);
+});
+
+test('returns 500 on an upstream error with no response and an unrecognised code', async () => {
+  mocks.upstream = { kind: 'network-error', message: 'unexpected TLS failure', code: 'EPROTO' };
+
+  const res = await call('/v1/tags/get?format=json');
+  const body = await res.json();
+  assert.equal(res.status, 500);
+  assert.equal(body.error, 'Internal server error');
+});
+
 test('forwards repeated query params (array values) as repeated keys to Pinboard', async () => {
   mocks.upstream = { kind: 'success', data: { posts: [] }, headers: { 'content-type': 'application/json' } };
 

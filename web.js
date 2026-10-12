@@ -63,20 +63,6 @@ app.use(helmet({
 // shrinks by roughly 80%.
 app.use(compression());
 
-// Rate limiting per IP for the generic proxy routes. CORS preflights are
-// skipped: they never reach Pinboard, and counting them would halve the
-// number of real requests a browser client could make.
-const limiter = rateLimit({
-  windowMs: IP_RATE_LIMIT_WINDOW_MS,
-  max: IP_RATE_LIMIT_MAX,
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
-  message: { error: 'Too many requests, please try again later.' },
-  skip: req => req.method === 'OPTIONS',
-});
-
-app.use('/v1/', limiter);
-
 // CORS configuration
 const corsOptions = {
   origin: (origin, callback) => {
@@ -96,6 +82,8 @@ const corsOptions = {
   credentials: true,
   methods: ['GET', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Requested-With', 'X-HTTP-Method-Override', 'Origin', 'Accept', 'Authorization'],
+  // Let browser clients read the throttle state the limiters report.
+  exposedHeaders: ['RateLimit-Policy', 'RateLimit-Limit', 'RateLimit-Remaining', 'RateLimit-Reset', 'Retry-After'],
   maxAge: CORS_PREFLIGHT_MAX_AGE_SECONDS,
 };
 
@@ -114,13 +102,44 @@ app.use((err, req, res, next) => {
   return res.status(500).json({ error: 'Internal server error' });
 });
 
+// Rate limiting per IP for the generic proxy routes. This sits after cors()
+// so a 429 still carries Access-Control-Allow-Origin; mounted before it, a
+// browser sees a throttle as an opaque network error and can't read the
+// JSON body or RateLimit-* headers. CORS preflights are skipped: they never
+// reach Pinboard, and counting them would halve the number of real requests
+// a browser client could make.
+const limiter = rateLimit({
+  windowMs: IP_RATE_LIMIT_WINDOW_MS,
+  max: IP_RATE_LIMIT_MAX,
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  message: { error: 'Too many requests, please try again later.' },
+  skip: req => req.method === 'OPTIONS',
+});
+
+app.use('/v1/', limiter);
+
 // XML parser configuration
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: '@_',
 });
 
-const USER_AGENT = 'pinboard-bridge/2.0 (+https://github.com/rossshannon/pinboard-bridge)';
+const USER_AGENT = `pinboard-bridge/${require('./package.json').version} (+https://github.com/rossshannon/pinboard-bridge)`;
+
+// Errors that mean the request never got an HTTP answer from Pinboard: DNS
+// (including the transient EAI_AGAIN), no route, refused, or a dropped
+// socket. These are reported as 503 rather than a generic 500.
+const UPSTREAM_UNREACHABLE_CODES = new Set([
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'EPIPE',
+]);
 
 // Axios configuration with timeout
 const apiRequestDefaults = {
@@ -582,7 +601,7 @@ app.get('/v1/*', async (req, res) => {
     }
 
     // Handle network-layer errors (DNS failure, connection refused, reset)
-    if (['ENOTFOUND', 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET'].includes(error.code)) {
+    if (UPSTREAM_UNREACHABLE_CODES.has(error.code)) {
       console.error('Pinboard API unreachable:', error.message);
       return res.status(503).json({ error: 'Pinboard API is unreachable' });
     }
