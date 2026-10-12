@@ -105,9 +105,11 @@ app.use((err, req, res, next) => {
 // Rate limiting per IP for the generic proxy routes. This sits after cors()
 // so a 429 still carries Access-Control-Allow-Origin; mounted before it, a
 // browser sees a throttle as an opaque network error and can't read the
-// JSON body or RateLimit-* headers. CORS preflights are skipped: they never
-// reach Pinboard, and counting them would halve the number of real requests
-// a browser client could make.
+// JSON body or RateLimit-* headers. CORS preflights must never count: they
+// never reach Pinboard, and counting them would halve the number of real
+// requests a browser client could make. cors() already ends them above; the
+// skip keeps that true if the order changes again. Requests from disallowed
+// origins also stop above, with a 403, and never reach Pinboard either.
 const limiter = rateLimit({
   windowMs: IP_RATE_LIMIT_WINDOW_MS,
   max: IP_RATE_LIMIT_MAX,
@@ -125,7 +127,7 @@ const xmlParser = new XMLParser({
   attributeNamePrefix: '@_',
 });
 
-const USER_AGENT = `pinboard-bridge/${require('./package.json').version} (+https://github.com/rossshannon/pinboard-bridge)`;
+const USER_AGENT = 'pinboard-bridge/2.0 (+https://github.com/rossshannon/pinboard-bridge)';
 
 // Errors that mean the request never got an HTTP answer from Pinboard: DNS
 // (including the transient EAI_AGAIN), no route, refused, or a dropped
@@ -138,7 +140,6 @@ const UPSTREAM_UNREACHABLE_CODES = new Set([
   'ETIMEDOUT',
   'EHOSTUNREACH',
   'ENETUNREACH',
-  'EPIPE',
 ]);
 
 // Axios configuration with timeout

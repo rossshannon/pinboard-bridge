@@ -47,6 +47,10 @@ test('a throttled /v1 response still carries CORS headers so the browser can rea
   const throttled = await call();
   assert.equal(throttled.status, 429);
   assert.equal(throttled.headers.get('access-control-allow-origin'), 'https://allowed.example.com');
+  const exposedOn429 = (throttled.headers.get('access-control-expose-headers') || '').toLowerCase();
+  assert.ok(exposedOn429.includes('retry-after'));
+  assert.ok(throttled.headers.get('retry-after'), 'expected Retry-After on the 429');
+  assert.ok(throttled.headers.get('ratelimit-reset'), 'expected RateLimit-Reset on the 429');
   const body = await throttled.json();
   assert.match(body.error, /too many requests/i);
 });

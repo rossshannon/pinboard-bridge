@@ -194,8 +194,7 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 
 ### Version 2.2.1
 - Mount the per-IP limiter after CORS, so a 429 carries `Access-Control-Allow-Origin` and browsers can read it instead of seeing a network error; expose the `RateLimit-*` and `Retry-After` headers to browser clients
-- Report `EAI_AGAIN`, `EHOSTUNREACH`, `ENETUNREACH` and `EPIPE` from Pinboard as 503 alongside the other network-layer failures
-- The outbound `User-Agent` now carries the real package version
+- Report `EAI_AGAIN`, `EHOSTUNREACH` and `ENETUNREACH` from Pinboard as 503 alongside the other network-layer failures
 
 ### Version 2.2.0
 - Move to the Heroku-26 stack (Ubuntu 26.04, supported until April 2031); `heroku.yml` and the new `app.json` both declare `heroku-26`
