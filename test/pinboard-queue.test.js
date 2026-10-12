@@ -13,7 +13,7 @@ process.env.PORT = '0';
 process.env.PINBOARD_MIN_INTERVAL_MS = '200';
 process.env.PINBOARD_MAX_QUEUE_MS = '1000';
 
-const { server } = require('../web.js');
+const { server, queuedPinboardCalls } = require('../web.js');
 
 before(async () => {
   if (!server.listening) await new Promise(resolve => server.once('listening', resolve));
@@ -28,9 +28,11 @@ const request = (path, signal) => fetch(`http://127.0.0.1:${server.address().por
   signal
 });
 
-const waitForCalls = async count => {
-  while (calls.length < count) await new Promise(resolve => setTimeout(resolve, 5));
+const until = async check => {
+  while (!check()) await new Promise(resolve => setTimeout(resolve, 2));
 };
+const waitForCalls = count => until(() => calls.length >= count);
+const waitForQueued = count => until(() => queuedPinboardCalls() === count);
 
 test('dropping a call from the middle of the queue moves the later calls up', async () => {
   const startedAt = Date.now();
@@ -38,10 +40,11 @@ test('dropping a call from the middle of the queue moves the later calls up', as
   await waitForCalls(1);
   const controller = new AbortController();
   const middle = request('/v1/posts/get?format=json&url=2', controller.signal).catch(() => null);
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitForQueued(1);
   const last = request('/v1/posts/get?format=json&url=3');
-  await new Promise(resolve => setTimeout(resolve, 30));
+  await waitForQueued(2);
   controller.abort();
+  await waitForQueued(1);
   await Promise.all([first, middle, last]);
 
   assert.equal(calls.length, 2);

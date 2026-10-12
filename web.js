@@ -51,14 +51,15 @@ const PINBOARD_TOTAL_BUDGET_MS = parseIntSetting('PINBOARD_TOTAL_BUDGET_MS', 250
 const PINBOARD_MAX_QUEUE_LIMIT_MS = Math.max(0, PINBOARD_TOTAL_BUDGET_MS - 5000);
 const PINBOARD_MAX_QUEUE_MS = (() => {
   const value = parseNonNegativeInt('PINBOARD_MAX_QUEUE_MS', 9000);
+  let capped = value;
   if (value > PINBOARD_MAX_QUEUE_LIMIT_MS) {
     console.warn(`PINBOARD_MAX_QUEUE_MS=${value} would run past Heroku's router timeout. Using ${PINBOARD_MAX_QUEUE_LIMIT_MS}.`);
-    return PINBOARD_MAX_QUEUE_LIMIT_MS;
+    capped = PINBOARD_MAX_QUEUE_LIMIT_MS;
   }
-  if (PINBOARD_MIN_INTERVAL_MS > 0 && value < PINBOARD_MIN_INTERVAL_MS) {
-    console.warn(`PINBOARD_MAX_QUEUE_MS=${value} is below PINBOARD_MIN_INTERVAL_MS=${PINBOARD_MIN_INTERVAL_MS}, so no call will ever be spaced.`);
+  if (PINBOARD_MIN_INTERVAL_MS > 0 && capped < PINBOARD_MIN_INTERVAL_MS) {
+    console.warn(`PINBOARD_MAX_QUEUE_MS is ${capped} (PINBOARD_TOTAL_BUDGET_MS=${PINBOARD_TOTAL_BUDGET_MS} allows at most ${PINBOARD_MAX_QUEUE_LIMIT_MS}), below PINBOARD_MIN_INTERVAL_MS=${PINBOARD_MIN_INTERVAL_MS}, so no call will ever be spaced.`);
   }
-  return value;
+  return capped;
 })();
 // Browsers must preflight every call to this bridge (the Authorization
 // header is not CORS-safelisted). Letting them cache the preflight verdict
@@ -667,14 +668,15 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
 
 // Finds where a page's head ends: </head> (not </header>), or the start of
 // <body> for pages that leave </head> out. Text inside scripts, styles,
-// templates and comments can contain either, so those are skipped. Fed the
-// page a chunk at a time; it remembers where it got to, so each byte is
-// scanned about once.
-const HEAD_TOKENS = /<\/head\s*>|<body[\s>]|<script\b|<style\b|<template\b|<!--/g;
+// titles and comments can contain either, so those are skipped, and so is
+// everything inside a <template>, which can nest. Fed the page a chunk at a
+// time; it remembers where it got to and keeps only the unscanned tail, so
+// each byte is scanned about once.
+const HEAD_TOKENS = /<\/head\s*>|<body[\s>]|<script\b|<style\b|<title\b|<template\b|<\/template\s*>|<!--(?:-?>)?/g;
 const RAW_TEXT_CLOSERS = {
   '<script': /<\/script\s*>/g,
   '<style': /<\/style\s*>/g,
-  '<template': /<\/template\s*>/g,
+  '<title': /<\/title\s*>/g,
   '<!--': /-->/g
 };
 // Long enough to hold any token above split across two chunks.
@@ -683,7 +685,8 @@ const HEAD_SCAN_OVERLAP = 32;
 const createHeadEndScanner = () => {
   let text = '';
   let pos = 0;
-  let closer = null;
+  let closer = null; // inside a script, style, title or comment
+  let templateDepth = 0;
   return chunk => {
     text += chunk.toString('latin1').toLowerCase();
     for (;;) {
@@ -691,9 +694,11 @@ const createHeadEndScanner = () => {
       pattern.lastIndex = pos;
       const match = pattern.exec(text);
       if (!match) {
-        // Nothing complete after pos; rescan only the tail, which may hold
+        // Nothing complete after pos; keep only the tail, which may hold
         // the start of a token the next chunk finishes.
-        pos = Math.max(pos, text.length - HEAD_SCAN_OVERLAP);
+        const keep = Math.max(pos, text.length - HEAD_SCAN_OVERLAP);
+        text = text.slice(keep);
+        pos = 0;
         return false;
       }
       pos = match.index + match[0].length;
@@ -702,11 +707,20 @@ const createHeadEndScanner = () => {
         continue;
       }
       const token = match[0].replace(/\s+$/, '');
+      if (token === '<!-->' || token === '<!--->') continue; // an empty comment
       if (RAW_TEXT_CLOSERS[token]) {
         closer = RAW_TEXT_CLOSERS[token];
         continue;
       }
-      return true; // </head> or <body
+      if (token === '<template') {
+        templateDepth += 1;
+        continue;
+      }
+      if (token.startsWith('</template')) {
+        templateDepth = Math.max(0, templateDepth - 1);
+        continue;
+      }
+      if (templateDepth === 0) return true; // </head> or <body
     }
   };
 };
@@ -1113,4 +1127,17 @@ const shutdown = () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-module.exports = { app, server, parseIntSetting, isPrivateAddress, isPrivateHostname, guardRedirect, fetchPreview, readHead, addressGuard };
+// Read-only view of the settings in force, and how many Pinboard calls are
+// queued, for tests.
+const pinboardSettings = Object.freeze({
+  minIntervalMs: PINBOARD_MIN_INTERVAL_MS,
+  totalBudgetMs: PINBOARD_TOTAL_BUDGET_MS,
+  maxQueueMs: PINBOARD_MAX_QUEUE_MS
+});
+const queuedPinboardCalls = () => {
+  let count = 0;
+  for (const queue of pinboardQueues.values()) count += queue.waiting.length;
+  return count;
+};
+
+module.exports = { app, server, parseIntSetting, pinboardSettings, queuedPinboardCalls, isPrivateAddress, isPrivateHostname, guardRedirect, fetchPreview, readHead, addressGuard };

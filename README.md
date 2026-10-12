@@ -212,7 +212,7 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 ### Version 2.3.0
 - Add `/preview`, which returns page metadata without waiting on Pinboard's `posts/suggest`
 - Space Pinboard calls for the same user three seconds apart, per Pinboard's guidance (`PINBOARD_MIN_INTERVAL_MS`, `PINBOARD_MAX_QUEUE_MS`)
-- Read preview pages only as far as `</head>` (or `<body>`, for pages that leave the closing tag out, skipping look-alikes inside scripts, styles, templates and comments), under one 5-second deadline for the whole fetch
+- Read preview pages only as far as `</head>` (or `<body>`, for pages that leave the closing tag out, skipping look-alikes inside scripts, styles, titles, comments and nested templates), under one 5-second deadline for the whole fetch
 - Tell clients only what kind of preview failure happened, keeping network error detail in the logs
 - Give each Pinboard call a deadline for the whole response, not just for gaps in it (`PINBOARD_TOTAL_BUDGET_MS`, at least 1000 ms)
 - Ignore numeric settings that aren't whole numbers, with a warning, instead of half-parsing them

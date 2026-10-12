@@ -191,6 +191,24 @@ test('ignores </head> and <body> inside scripts, styles, templates and comments'
   assert.ok(await allClosed(), 'expected the bridge to close the connection');
 });
 
+test('ignores head-like text in titles and nested templates, and empty comments', async () => {
+  routes['/trickier-head'] = (req, res) => {
+    html(res);
+    const parts = [
+      '<html><head><title>About <script> tags and <body></title>',
+      '<template><template></template><body></head></template>',
+      '<!--><!--->',
+      '<meta property="og:description" content="Past the second decoys"></head><body>'
+    ];
+    parts.forEach((part, i) => setTimeout(() => res.write(part), i * 20));
+  };
+  const startedAt = Date.now();
+  const preview = await fetchPreview(new URL(`${base}/trickier-head`));
+  assert.equal(preview.description, 'Past the second decoys');
+  assert.ok(Date.now() - startedAt < 1000, 'expected the read to stop at the real </head>');
+  assert.ok(await allClosed(), 'expected the bridge to close the connection');
+});
+
 test('refuses a hostname that resolves to a private address', async () => {
   await assert.rejects(
     fetchPreview(new URL(`http://private.test:${target.address().port}/`)),
