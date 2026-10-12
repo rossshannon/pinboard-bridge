@@ -42,7 +42,7 @@ const parsePositiveInt = (name, fallback) => parseIntSetting(name, fallback, { m
 const PINBOARD_MIN_INTERVAL_MS = parseNonNegativeInt('PINBOARD_MIN_INTERVAL_MS', 3000);
 // Heroku's router gives up on a request after 30 s. Queueing plus the Pinboard
 // call must finish inside this, leaving room to send the response.
-const PINBOARD_TOTAL_BUDGET_MS = parsePositiveInt('PINBOARD_TOTAL_BUDGET_MS', 25000);
+const PINBOARD_TOTAL_BUDGET_MS = parseIntSetting('PINBOARD_TOTAL_BUDGET_MS', 25000, { min: 1000 });
 // A call that would have to queue longer than this goes straight through
 // instead, so a burst degrades to unspaced calls rather than piling up
 // towards Heroku's 30s router timeout.
@@ -247,7 +247,9 @@ const pinboardGet = async (url, authContext, label, clientGone = null) => {
     }
     // Time spent queueing comes out of the budget, so the whole request
     // still fits inside Heroku's router timeout.
-    const timeout = Math.max(1000, PINBOARD_TOTAL_BUDGET_MS - waitMs);
+    // waitMs never exceeds PINBOARD_MAX_QUEUE_MS, which is capped 5 s inside
+    // the budget, so this is always positive.
+    const timeout = PINBOARD_TOTAL_BUDGET_MS - waitMs;
     // axios's timeout only notices a stalled socket, so a response that
     // trickles in could run on; this deadline covers the whole call.
     const deadline = new AbortController();
@@ -623,10 +625,51 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
   };
 };
 
-// </head> with optional whitespace before the >; not </header> or </headline>.
-// HTML lets a page leave </head> out, so the start of <body> also ends it.
-const HEAD_CLOSE = /<\/head\s*>|<body[\s>]/;
-const HEAD_CLOSE_CARRY = 32;
+// Finds where a page's head ends: </head> (not </header>), or the start of
+// <body> for pages that leave </head> out. Text inside scripts, styles,
+// templates and comments can contain either, so those are skipped. Fed the
+// page a chunk at a time; it remembers where it got to, so each byte is
+// scanned about once.
+const HEAD_TOKENS = /<\/head\s*>|<body[\s>]|<script\b|<style\b|<template\b|<!--/g;
+const RAW_TEXT_CLOSERS = {
+  '<script': /<\/script\s*>/g,
+  '<style': /<\/style\s*>/g,
+  '<template': /<\/template\s*>/g,
+  '<!--': /-->/g
+};
+// Long enough to hold any token above split across two chunks.
+const HEAD_SCAN_OVERLAP = 32;
+
+const createHeadEndScanner = () => {
+  let text = '';
+  let pos = 0;
+  let closer = null;
+  return chunk => {
+    text += chunk.toString('latin1').toLowerCase();
+    for (;;) {
+      const pattern = closer || HEAD_TOKENS;
+      pattern.lastIndex = pos;
+      const match = pattern.exec(text);
+      if (!match) {
+        // Nothing complete after pos; rescan only the tail, which may hold
+        // the start of a token the next chunk finishes.
+        pos = Math.max(pos, text.length - HEAD_SCAN_OVERLAP);
+        return false;
+      }
+      pos = match.index + match[0].length;
+      if (closer) {
+        closer = null;
+        continue;
+      }
+      const token = match[0].replace(/\s+$/, '');
+      if (RAW_TEXT_CLOSERS[token]) {
+        closer = RAW_TEXT_CLOSERS[token];
+        continue;
+      }
+      return true; // </head> or <body
+    }
+  };
+};
 
 // Read a streamed response until </head> (or the byte cap) and drop the rest
 // of the page. Non-stream bodies (strings, buffers) are returned as they are.
@@ -638,7 +681,7 @@ const readHead = async data => {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let length = 0;
-    let carry = '';
+    const reachedHeadEnd = createHeadEndScanner();
     let settled = false;
     const finish = () => {
       if (settled) return;
@@ -649,11 +692,7 @@ const readHead = async data => {
     data.on('data', chunk => {
       chunks.push(chunk);
       length += chunk.length;
-      // Search this chunk plus the end of the previous one, so a tag split
-      // across two chunks is still found.
-      const window = carry + chunk.toString('latin1').toLowerCase();
-      carry = window.slice(-HEAD_CLOSE_CARRY);
-      if (HEAD_CLOSE.test(window) || length >= PREVIEW_HEAD_MAX_BYTES) {
+      if (reachedHeadEnd(chunk) || length >= PREVIEW_HEAD_MAX_BYTES) {
         finish();
       }
     });

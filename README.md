@@ -45,7 +45,7 @@ cp .env.example .env
 | `PAGE_PREVIEW_RATE_LIMIT_MAX` | `/preview` requests allowed per IP per minute | 60 | No |
 | `PINBOARD_MIN_INTERVAL_MS` | Minimum gap between the starts of two Pinboard calls for the same user (`0` turns spacing off) | 3000 | No |
 | `PINBOARD_MAX_QUEUE_MS` | Longest a call will wait for its slot; a call that would wait longer is sent straight away. Capped at the budget below minus 5 s | 9000 | No |
-| `PINBOARD_TOTAL_BUDGET_MS` | Longest a Pinboard call may take, queueing included, before the bridge answers 504 | 25000 | No |
+| `PINBOARD_TOTAL_BUDGET_MS` | Longest a Pinboard call may take, queueing included, before the bridge answers 504 (at least 1000) | 25000 | No |
 
 Numeric settings must be whole numbers; anything else (`-1`, `1e3`, `300ms`) is ignored with a warning and the default is used.
 
@@ -212,9 +212,9 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 ### Version 2.3.0
 - Add `/preview`, which returns page metadata without waiting on Pinboard's `posts/suggest`
 - Space Pinboard calls for the same user three seconds apart, per Pinboard's guidance (`PINBOARD_MIN_INTERVAL_MS`, `PINBOARD_MAX_QUEUE_MS`)
-- Read preview pages only as far as `</head>` (or `<body>`, for pages that leave the closing tag out), under one 5-second deadline for the whole fetch
+- Read preview pages only as far as `</head>` (or `<body>`, for pages that leave the closing tag out, skipping look-alikes inside scripts, styles, templates and comments), under one 5-second deadline for the whole fetch
 - Tell clients only what kind of preview failure happened, keeping network error detail in the logs
-- Give each Pinboard call a deadline for the whole response, not just for gaps in it (`PINBOARD_TOTAL_BUDGET_MS`)
+- Give each Pinboard call a deadline for the whole response, not just for gaps in it (`PINBOARD_TOTAL_BUDGET_MS`, at least 1000 ms)
 - Ignore numeric settings that aren't whole numbers, with a warning, instead of half-parsing them
 - Correct the documented `ALLOWED_ORIGINS` for Pincushion to `https://rossshannon.github.io`
 - Harden the preview fetcher's SSRF guard: refuse hostnames that resolve to private addresses, redirects to private hosts, and `0.0.0.0/8`, `100.64.0.0/10`, reserved, benchmarking and multicast IPv4, link-local, site-local and multicast IPv6, and IPv6 forms that embed an IPv4 address (mapped, compatible, NAT64, 6to4, Teredo)

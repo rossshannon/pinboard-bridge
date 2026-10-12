@@ -174,6 +174,23 @@ test('does not mistake </header> for the end of the head', async () => {
   assert.equal(preview.description, 'After the script');
 });
 
+test('ignores </head> and <body> inside scripts, styles, templates and comments', async () => {
+  routes['/tricky-head'] = (req, res) => {
+    html(res);
+    // Each raw-text block holds a fake boundary, split across writes.
+    const parts = [
+      '<html><head><title>Tricky</title><script>var t = "</he',
+      'ad><body>";</script><style>/* </head> */</style>',
+      '<template><body></template><!-- <body> </head> -->',
+      '<meta property="og:description" content="Past the decoys"></HEAD ><body>'
+    ];
+    parts.forEach((part, i) => setTimeout(() => res.write(part), i * 20));
+  };
+  const preview = await fetchPreview(new URL(`${base}/tricky-head`));
+  assert.equal(preview.description, 'Past the decoys');
+  assert.ok(await allClosed(), 'expected the bridge to close the connection');
+});
+
 test('refuses a hostname that resolves to a private address', async () => {
   await assert.rejects(
     fetchPreview(new URL(`http://private.test:${target.address().port}/`)),

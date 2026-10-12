@@ -5,7 +5,7 @@ const axios = require('axios');
 
 process.env.PORT = '0';
 process.env.PINBOARD_MIN_INTERVAL_MS = '0';
-process.env.PINBOARD_TOTAL_BUDGET_MS = '300';
+process.env.PINBOARD_TOTAL_BUDGET_MS = '1000';
 
 // Like a Pinboard response that keeps trickling in: never finishes, never
 // goes quiet long enough for axios's own timeout, until the call is aborted.
@@ -29,7 +29,7 @@ test('a Pinboard response that never finishes is cut off at the budget with a 50
     headers: { Authorization: 'Basic ' + Buffer.from('alice:secret').toString('base64') }
   });
   assert.equal(res.status, 504);
-  assert.ok(Date.now() - startedAt < 2000, 'expected the call to stop at its budget');
+  assert.ok(Date.now() - startedAt < 2500, 'expected the call to stop at its budget');
 });
 
 test('whole-number settings reject anything that is not one', () => {
@@ -51,6 +51,7 @@ test('whole-number settings reject anything that is not one', () => {
     assert.equal(read('300ms'), 42);
     assert.equal(read('0'), 42);
     assert.equal(read('0', 0), 0);
+    assert.equal(read('999', 1000), 42);
     assert.equal(read(''), 42);
   } finally {
     console.warn = originalWarn;
