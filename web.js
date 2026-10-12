@@ -20,6 +20,9 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 const PINBOARD_BASE_URL = 'https://api.pinboard.in';
 const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 const PREVIEW_TIMEOUT_MS = 5000;
+// Heroku's router gives up on a request after 30 s. Queueing plus the Pinboard
+// call must finish inside this, leaving room to send the response.
+const PINBOARD_TOTAL_BUDGET_MS = 25000;
 // Everything a preview needs lives in <head>, so stop reading there. This cap
 // only applies when a page never closes its <head>.
 const PREVIEW_HEAD_MAX_BYTES = 512 * 1024;
@@ -191,7 +194,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 // GET a Pinboard API URL on behalf of a user, spaced per user, and log how
 // long it queued and how long Pinboard took. The URL is not logged: it can
 // carry the auth token.
-const pinboardGet = async (url, authContext, label) => {
+const pinboardGet = async (url, authContext, label, clientGone = null) => {
   const waitMs = reservePinboardSlot(authContext.slotKey);
   if (waitMs > 0) {
     await sleep(waitMs);
@@ -199,9 +202,15 @@ const pinboardGet = async (url, authContext, label) => {
   const startedAt = Date.now();
   let outcome = 'ok';
   try {
-    // Time spent queueing comes out of the 30s budget, so the whole request
+    // The browser gave up while this call queued: don't spend a Pinboard call on nobody.
+    if (clientGone?.aborted) {
+      const gone = new Error('Client closed the request before Pinboard was called');
+      gone.code = 'ECLIENTGONE';
+      throw gone;
+    }
+    // Time spent queueing comes out of the budget, so the whole request
     // still fits inside Heroku's router timeout.
-    const timeout = Math.max(1000, apiRequestDefaults.timeout - waitMs);
+    const timeout = Math.max(1000, PINBOARD_TOTAL_BUDGET_MS - waitMs);
     return await axios.get(url, { ...authContext.requestConfig, timeout });
   } catch (error) {
     outcome = error.response?.status ? String(error.response.status) : (error.code || 'error');
@@ -209,6 +218,15 @@ const pinboardGet = async (url, authContext, label) => {
   } finally {
     console.info(`[pinboard] user=${authContext.identity} call=${label} waitMs=${waitMs} upstreamMs=${Date.now() - startedAt} outcome=${outcome}`);
   }
+};
+
+// Aborts once the client disconnects before the response is sent.
+const clientGoneSignal = (res) => {
+  const controller = new AbortController();
+  res.on('close', () => {
+    if (!res.writableFinished) controller.abort();
+  });
+  return controller.signal;
 };
 
 const timed = async promise => {
@@ -248,6 +266,10 @@ const decodeBasicCredentials = encoded => {
   };
 };
 
+// Usernames come straight from the client's header and go into log lines, so
+// keep them to characters that can't forge a line or a field.
+const logSafeIdentity = value => String(value || '').replace(/[^\w.@+-]/g, '?').slice(0, 64) || 'unknown';
+
 const applyAuthContext = (req, queryParams) => {
   if (queryParams) {
     queryParams.delete('auth_token');
@@ -268,7 +290,7 @@ const applyAuthContext = (req, queryParams) => {
         ...apiRequestDefaults,
         auth: { username, password }
       },
-      identity: username,
+      identity: logSafeIdentity(username),
       slotKey
     };
   }
@@ -283,7 +305,7 @@ const applyAuthContext = (req, queryParams) => {
     }
     return {
       requestConfig: { ...apiRequestDefaults },
-      identity: authToken.split(':')[0] || 'token',
+      identity: logSafeIdentity(authToken.split(':')[0] || 'token'),
       slotKey
     };
   }
@@ -299,7 +321,56 @@ const isPrivateIPv4 = address => {
   if (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) return true; // CGNAT
   if (octets[0] === 169 && octets[1] === 254) return true;
   if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) return true;
+  if (octets[0] === 192 && octets[1] === 0 && octets[2] === 0) return true; // IETF protocol assignments
   if (octets[0] === 192 && octets[1] === 168) return true;
+  if (octets[0] === 198 && (octets[1] === 18 || octets[1] === 19)) return true; // benchmarking
+  if (octets[0] >= 224) return true; // multicast, reserved and broadcast
+  return false;
+};
+
+// Expand an IPv6 address to its eight 16-bit groups, or null if it isn't one.
+const ipv6Groups = address => {
+  let text = address;
+  const dotted = text.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) {
+    const octets = dotted[2].split('.').map(Number);
+    text = dotted[1] + ((octets[0] << 8) | octets[1]).toString(16) + ':' + ((octets[2] << 8) | octets[3]).toString(16);
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
+  const groups = [...head, ...Array(halves.length === 2 ? missing : 0).fill('0'), ...tail].map(group => parseInt(group, 16));
+  return groups.length === 8 && groups.every(group => group >= 0 && group <= 0xffff) ? groups : null;
+};
+
+const ipv4FromGroups = (high, low) => `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
+
+const isPrivateIPv6 = address => {
+  const groups = ipv6Groups(address);
+  if (!groups) return true; // unparseable: refuse rather than guess
+  const [g0, g1, g2, g3, g4, g5, g6, g7] = groups;
+  const firstSixZero = groups.slice(0, 6).every(group => group === 0);
+  if (firstSixZero) {
+    // ::, ::1 and IPv4-compatible ::a.b.c.d
+    return g6 === 0 || isPrivateIPv4(ipv4FromGroups(g6, g7));
+  }
+  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && (g4 === 0 || g4 === 0xffff) && (g5 === 0xffff || g5 === 0)) {
+    // IPv4-mapped ::ffff:a.b.c.d and IPv4-translated ::ffff:0:a.b.c.d
+    return isPrivateIPv4(ipv4FromGroups(g6, g7));
+  }
+  if (g0 === 0x64 && g1 === 0xff9b) {
+    // NAT64: 64:ff9b::/96 embeds an IPv4 address; 64:ff9b:1::/48 is local use
+    return g2 !== 0 || isPrivateIPv4(ipv4FromGroups(g6, g7));
+  }
+  if (g0 === 0x2002) return isPrivateIPv4(ipv4FromGroups(g1, g2)); // 6to4
+  if (g0 === 0x2001 && g1 === 0) return true; // Teredo
+  if ((g0 & 0xfe00) === 0xfc00) return true; // unique local fc00::/7
+  if ((g0 & 0xffc0) === 0xfe80) return true; // link-local fe80::/10
+  if ((g0 & 0xffc0) === 0xfec0) return true; // site-local fec0::/10
+  if ((g0 & 0xff00) === 0xff00) return true; // multicast
   return false;
 };
 
@@ -308,37 +379,25 @@ const isPrivateAddress = address => {
   const bare = String(address || '').replace(/^\[|\]$/g, '').toLowerCase();
   const ipVersion = net.isIP(bare);
   if (ipVersion === 4) return isPrivateIPv4(bare);
-  if (ipVersion === 6) {
-    if (bare === '::' || bare === '::1') return true;
-    if (bare.startsWith('fc') || bare.startsWith('fd')) return true; // unique local
-    if (/^fe[89ab]/.test(bare)) return true; // link-local
-    // IPv4-mapped (::ffff:a.b.c.d, which URL parsing rewrites as ::ffff:xxxx:xxxx)
-    const mapped = bare.match(/^::ffff:(.+)$/);
-    if (mapped) {
-      const tail = mapped[1];
-      if (net.isIP(tail) === 4) return isPrivateIPv4(tail);
-      const hex = tail.split(':');
-      if (hex.length === 2) {
-        const high = parseInt(hex[0], 16);
-        const low = parseInt(hex[1], 16);
-        return isPrivateIPv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
-      }
-    }
-    return false;
-  }
+  if (ipVersion === 6) return isPrivateIPv6(bare);
   return false;
 };
+
+// Tests swap `isPrivate` to let a loopback test server through; everything
+// that checks an address goes through here.
+const addressGuard = { isPrivate: isPrivateAddress };
 
 const isPrivateHostname = hostname => {
   if (!hostname) return true;
   // Node's URL parser keeps IPv6 hosts wrapped in brackets (e.g. "[::1]"),
-  // but net.isIP only recognises the unwrapped form.
-  const bare = hostname.replace(/^\[|\]$/g, '');
+  // but net.isIP only recognises the unwrapped form. A trailing dot is the
+  // same name as without it.
+  const bare = hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, '');
   const lower = bare.toLowerCase();
-  if (lower === 'localhost' || lower.endsWith('.localhost')) {
+  if (!lower || lower === 'localhost' || lower.endsWith('.localhost')) {
     return true;
   }
-  return net.isIP(bare) ? isPrivateAddress(bare) : false;
+  return net.isIP(bare) ? addressGuard.isPrivate(bare) : false;
 };
 
 // DNS lookup for preview fetches that refuses names resolving to private
@@ -352,7 +411,7 @@ const guardedLookup = (hostname, options, callback) => {
   dns.lookup(hostname, options, (err, address, family) => {
     if (err) return callback(err);
     const addresses = Array.isArray(address) ? address : [{ address, family }];
-    if (addresses.some(entry => isPrivateAddress(entry.address))) {
+    if (addresses.some(entry => addressGuard.isPrivate(entry.address))) {
       const blocked = new Error(`Preview host ${hostname} resolves to a private address`);
       blocked.code = 'EPRIVATEADDRESS';
       return callback(blocked);
@@ -368,10 +427,13 @@ const guardRedirect = options => {
   }
 };
 
+// Resolve a page-supplied link, keeping only http(s): a javascript: or data:
+// URL must never reach a client that renders it as a link or image.
 const resolveAbsoluteUrl = (baseUrl, value) => {
   if (!value) return null;
   try {
-    return new URL(value, baseUrl).toString();
+    const resolved = new URL(value, baseUrl);
+    return ['http:', 'https:'].includes(resolved.protocol) ? resolved.toString() : null;
   } catch (err) {
     return null;
   }
@@ -479,16 +541,19 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
     || pickMetaValue($, 'meta[property="og:url"]')
     || pickMetaValue($, 'meta[name="twitter:url"]');
 
-  const canonicalUrl = resolveAbsoluteUrl(finalUrl, canonical) || finalUrl || originalUrl;
-  const imageUrl = resolveAbsoluteUrl(canonicalUrl, rawImage);
-  const siteDomain = deriveSiteDomain(canonicalUrl || originalUrl);
+  const pageUrl = finalUrl || originalUrl;
+  const canonicalUrl = resolveAbsoluteUrl(pageUrl, canonical) || pageUrl;
+  // Relative links resolve against the page that was fetched, and the domain
+  // shown is the one actually fetched: a page can name any canonical URL.
+  const imageUrl = resolveAbsoluteUrl(pageUrl, rawImage);
+  const siteDomain = deriveSiteDomain(pageUrl);
 
   const themeColor = pickMetaValue($, 'meta[name="theme-color"]')
     || pickMetaValue($, 'meta[name="msapplication-TileColor"]')
     || pickMetaValue($, 'meta[name="msapplication-navbutton-color"]');
 
   const rawFavicon = selectFavicon($);
-  const faviconUrl = resolveAbsoluteUrl(canonicalUrl || finalUrl || originalUrl, rawFavicon);
+  const faviconUrl = resolveAbsoluteUrl(pageUrl, rawFavicon);
 
   if (!title && !description && !imageUrl) {
     return null;
@@ -511,7 +576,9 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
   };
 };
 
-const HEAD_CLOSE = '</head';
+// </head> with optional whitespace before the >; not </header> or </headline>.
+const HEAD_CLOSE = /<\/head\s*>/;
+const HEAD_CLOSE_CARRY = 32;
 
 // Read a streamed response until </head> (or the byte cap) and drop the rest
 // of the page. Non-stream bodies (strings, buffers) are returned as they are.
@@ -537,8 +604,8 @@ const readHead = async data => {
       // Search this chunk plus the end of the previous one, so a tag split
       // across two chunks is still found.
       const window = carry + chunk.toString('latin1').toLowerCase();
-      carry = window.slice(-HEAD_CLOSE.length);
-      if (window.includes(HEAD_CLOSE) || length >= PREVIEW_HEAD_MAX_BYTES) {
+      carry = window.slice(-HEAD_CLOSE_CARRY);
+      if (HEAD_CLOSE.test(window) || length >= PREVIEW_HEAD_MAX_BYTES) {
         finish();
       }
     });
@@ -556,8 +623,9 @@ const fetchPreview = async targetUrl => {
   // for each socket going quiet.
   const controller = new AbortController();
   const deadline = setTimeout(() => controller.abort(), PREVIEW_TIMEOUT_MS);
+  let response;
   try {
-    const response = await axios.get(targetUrl.toString(), {
+    response = await axios.get(targetUrl.toString(), {
       ...previewRequestConfig,
       lookup: guardedLookup,
       beforeRedirect: guardRedirect,
@@ -566,9 +634,6 @@ const fetchPreview = async targetUrl => {
     const finalUrl = response.request?.res?.responseUrl || targetUrl.toString();
     const contentType = response.headers['content-type'] || '';
     if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
-      if (response.data && typeof response.data.destroy === 'function') {
-        response.data.destroy();
-      }
       throw new Error('Preview response is not HTML');
     }
 
@@ -584,6 +649,10 @@ const fetchPreview = async targetUrl => {
     throw error;
   } finally {
     clearTimeout(deadline);
+    // Destroying axios's stream wrapper before it is read leaves the socket
+    // open, so tear down the request itself once we're done with the page.
+    response?.request?.destroy?.();
+    response?.data?.destroy?.();
   }
 };
 
@@ -649,7 +718,9 @@ const suggestWithPreviewRateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many preview requests, please slow down.' },
-  keyGenerator: req => req.headers['authorization'] || req.ip,
+  // The header isn't checked against Pinboard here, so key on the IP too:
+  // rotating made-up headers can't buy a fresh allowance.
+  keyGenerator: req => `${req.ip}|${req.headers['authorization'] || ''}`,
 });
 
 // /preview never calls Pinboard, so it only needs a guard against scraping.
@@ -660,7 +731,9 @@ const pagePreviewRateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many preview requests, please slow down.' },
-  keyGenerator: req => req.headers['authorization'] || req.ip,
+  // The header isn't checked against Pinboard here, so key on the IP too:
+  // rotating made-up headers can't buy a fresh allowance.
+  keyGenerator: req => `${req.ip}|${req.headers['authorization'] || ''}`,
 });
 
 // Health check endpoint
@@ -711,7 +784,7 @@ app.get('/preview', limiter, pagePreviewRateLimiter, async (req, res) => {
 // Suggest with preview endpoint. Kept for older clients; it answers only once
 // both halves are done, so newer clients call /preview and /v1/posts/suggest
 // separately.
-app.get('/posts/suggest-with-preview', suggestWithPreviewRateLimiter, async (req, res) => {
+app.get('/posts/suggest-with-preview', limiter, suggestWithPreviewRateLimiter, async (req, res) => {
   try {
     const normalizedUrl = parsePreviewTarget(req, res);
     if (!normalizedUrl) return;
@@ -728,7 +801,7 @@ app.get('/posts/suggest-with-preview', suggestWithPreviewRateLimiter, async (req
     }
 
     const pinboardUrl = `${PINBOARD_BASE_URL}/v1/posts/suggest?${pinboardParams.toString()}`;
-    const suggestionsPromise = timed(pinboardGet(pinboardUrl, authContext, 'posts/suggest'));
+    const suggestionsPromise = timed(pinboardGet(pinboardUrl, authContext, 'posts/suggest', clientGoneSignal(res)));
     const previewPromise = timed(fetchPreview(normalizedUrl));
 
     const [suggestionsResult, previewResult] = await Promise.allSettled([suggestionsPromise, previewPromise]);
@@ -813,7 +886,7 @@ app.get('/v1/*', async (req, res) => {
     }
 
     // Make request to Pinboard API
-    const response = await pinboardGet(url, authContext, path.replace(/^\/v1\//, ''));
+    const response = await pinboardGet(url, authContext, path.replace(/^\/v1\//, ''), clientGoneSignal(res));
     const { data, status } = response;
 
     if (status !== 200) {
@@ -890,4 +963,4 @@ const shutdown = () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-module.exports = { app, server, isPrivateAddress, isPrivateHostname, guardRedirect };
+module.exports = { app, server, isPrivateAddress, isPrivateHostname, guardRedirect, fetchPreview, addressGuard };

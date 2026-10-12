@@ -218,6 +218,39 @@ test('time spent queueing comes out of the Pinboard timeout', async () => {
     axios.defaults.adapter = originalAdapter;
   }
   timeouts.sort((a, b) => b - a);
-  assert.equal(timeouts[0], 30000);
-  assert.ok(timeouts[1] <= 29720 && timeouts[1] >= 29600, `expected ~29700ms, got ${timeouts[1]}`);
+  assert.equal(timeouts[0], 25000);
+  assert.ok(timeouts[1] <= 24720 && timeouts[1] >= 24600, `expected ~24700ms, got ${timeouts[1]}`);
 });
+
+test('a username cannot forge extra log lines or fields', async () => {
+  const lines = [];
+  const originalInfo = console.info;
+  console.info = (...args) => { lines.push(args.join(' ')); };
+  try {
+    const forged = 'bob\nFAKE [pinboard] user=admin';
+    await fetch(`${baseUrl()}/v1/posts/get?format=json&url=a`, {
+      headers: { Authorization: 'Basic ' + Buffer.from(`${forged}:secret`).toString('base64') }
+    });
+  } finally {
+    console.info = originalInfo;
+  }
+  const pinboardLines = lines.filter(line => line.includes('[pinboard]'));
+  assert.equal(pinboardLines.length, 1);
+  assert.ok(!pinboardLines[0].includes('\n'));
+  assert.match(pinboardLines[0], /^\[pinboard\] user=bob\?FAKE\?\?pinboard\?\?user\?admin call=/);
+});
+
+test('a queued call is dropped if the client has gone by its turn', async () => {
+  const first = call('/v1/posts/get?format=json&url=1');
+  const controller = new AbortController();
+  const second = fetch(`${baseUrl()}/v1/posts/get?format=json&url=2`, {
+    headers: { Authorization: basic('alice') },
+    signal: controller.signal
+  }).catch(() => null);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  controller.abort();
+  await Promise.all([first, second]);
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.equal(calls.filter(c => c.url.includes('api.pinboard.in')).length, 1);
+});
+
