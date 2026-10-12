@@ -286,3 +286,14 @@ test('a dropped call gives its slot back to the next one', async () => {
   // release it would face a 600ms slot, over the 500ms cap, and skip the queue.
   assert.ok(offsets[1] >= 280 && offsets[1] < 500, `expected the next call at ~300ms, got ${offsets[1]}ms`);
 });
+
+test('changing the Authorization header does not reset the /preview allowance', async () => {
+  const remaining = async user => {
+    const res = await call(`/preview?url=${encodeURIComponent('http://127.0.0.1/')}`, user);
+    return Number(res.headers.get('ratelimit-remaining'));
+  };
+  const first = await remaining('alice');
+  const second = await remaining('mallory');
+  assert.ok(Number.isFinite(first), 'expected RateLimit headers on /preview');
+  assert.equal(second, first - 1);
+});

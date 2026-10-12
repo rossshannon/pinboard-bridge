@@ -654,6 +654,9 @@ const fetchPreview = async targetUrl => {
     const body = await readHead(response.data);
     return extractPreviewMetadata(body, finalUrl, targetUrl.toString());
   } catch (error) {
+    // A 4xx/5xx rejects with the unread response attached; it needs tearing
+    // down just the same.
+    response = response || error.response;
     if (controller.signal.aborted) {
       throw new Error(`Preview fetch timed out after ${PREVIEW_TIMEOUT_MS}ms`);
     }
@@ -732,9 +735,9 @@ const suggestWithPreviewRateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many preview requests, please slow down.' },
-  // The header isn't checked against Pinboard here, so key on the IP too:
-  // rotating made-up headers can't buy a fresh allowance.
-  keyGenerator: req => `${req.ip}|${req.headers['authorization'] || ''}`,
+  // Keyed on the client IP (the default). The Authorization header isn't
+  // checked here, so keying on it would let a client buy a fresh allowance
+  // just by changing it.
 });
 
 // /preview never calls Pinboard, so it only needs a guard against scraping.
@@ -745,9 +748,9 @@ const pagePreviewRateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many preview requests, please slow down.' },
-  // The header isn't checked against Pinboard here, so key on the IP too:
-  // rotating made-up headers can't buy a fresh allowance.
-  keyGenerator: req => `${req.ip}|${req.headers['authorization'] || ''}`,
+  // Keyed on the client IP (the default). The Authorization header isn't
+  // checked here, so keying on it would let a client buy a fresh allowance
+  // just by changing it.
 });
 
 // Health check endpoint

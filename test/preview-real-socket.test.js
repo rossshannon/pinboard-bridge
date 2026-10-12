@@ -81,6 +81,18 @@ test('closes the connection on a non-HTML response it never reads', async () => 
   assert.ok(await allClosed(), 'expected the bridge to close the connection');
 });
 
+test('closes the connection on an error page with a slow body', async () => {
+  for (const status of [404, 500]) {
+    routes[`/error-${status}`] = (req, res) => {
+      res.writeHead(status, { 'content-type': 'text/html' });
+      res.write('<html><head><title>Error</title>');
+      // Never ended: only the bridge hanging up closes this.
+    };
+    await assert.rejects(fetchPreview(new URL(`${base}/error-${status}`)), new RegExp(String(status)));
+    assert.ok(await allClosed(), `expected the bridge to close the connection after a ${status}`);
+  }
+});
+
 test('stops at the byte cap when a page never closes its head', async () => {
   routes['/no-head-end'] = (req, res) => {
     html(res);

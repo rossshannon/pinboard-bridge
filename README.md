@@ -41,8 +41,8 @@ cp .env.example .env
 | `NODE_ENV` | Environment mode | development | No |
 | `ALLOWED_ORIGINS` | Comma-separated list of allowed CORS origins | (all origins) | No |
 | `IP_RATE_LIMIT_MAX` | Requests allowed per source IP per 15 minutes on `/v1/*` | 300 | No |
-| `PREVIEW_RATE_LIMIT_MAX` | `/posts/suggest-with-preview` requests allowed per token per minute | 20 | No |
-| `PAGE_PREVIEW_RATE_LIMIT_MAX` | `/preview` requests allowed per token per minute | 60 | No |
+| `PREVIEW_RATE_LIMIT_MAX` | `/posts/suggest-with-preview` requests allowed per IP per minute | 20 | No |
+| `PAGE_PREVIEW_RATE_LIMIT_MAX` | `/preview` requests allowed per IP per minute | 60 | No |
 | `PINBOARD_MIN_INTERVAL_MS` | Minimum gap between the starts of two Pinboard calls for the same user (`0` turns spacing off) | 3000 | No |
 | `PINBOARD_MAX_QUEUE_MS` | Longest a call will wait for its slot; a call that would wait longer is sent straight away | 9000 | No |
 
@@ -64,7 +64,7 @@ ALLOWED_ORIGINS=https://rossshannon.github.com
 - 300 requests per 15 minutes are allowed per source IP on `/v1/*`. This mirrors Pinboard's published guidance of one call per user per three seconds. Heroku users should ensure `app.set('trust proxy', 1)` remains enabled so the limiter sees client IPs.
 - CORS preflight (`OPTIONS`) requests are not counted. Browsers must preflight every call because of the `Authorization` header, so counting them would halve the usable budget.
 - When throttled, responses include standard `RateLimit-*` headers so the UI can surface “retry-after” information.
-- `/posts/suggest-with-preview` adds a per-token limiter (20 requests/minute) to prevent abusive preview scraping and to stay within Pinboard's own limits. `/preview` makes no Pinboard call, so its per-token limit is looser (60 requests/minute). Both also count against the per-IP limit above, and their per-token limits are keyed on the IP and the header together, so rotating made-up headers doesn't buy a fresh allowance.
+- `/posts/suggest-with-preview` adds a per-IP limiter (20 requests/minute) to prevent abusive preview scraping and to stay within Pinboard's own limits. `/preview` makes no Pinboard call, so its limit is looser (60 requests/minute per IP). Both also count against the per-IP limit above. They are keyed on the IP rather than the `Authorization` header, which isn't checked against Pinboard on these routes, so changing the header doesn't buy a fresh allowance.
 - `/preview` only checks that an `Authorization` header is well formed; it doesn't ask Pinboard whether the credentials are real, since that would cost a Pinboard call. Anyone can use it as a page-head fetcher within the per-IP limit.
 - Pinboard asks for at most one call per user every three seconds. The bridge spaces calls for the same user that far apart (start to start) by holding a later call until its slot. A call that would have to wait more than `PINBOARD_MAX_QUEUE_MS` is sent straight away instead, so a burst never queues towards Heroku's 30-second router timeout, and time spent waiting is taken off the call's 25-second Pinboard budget, leaving room inside the router timeout. If the client disconnects while its call is queued, the call is dropped rather than sent. Slots are keyed on the whole `Authorization` header, so a request with someone else's username and a wrong token can't use up their slots. Spacing lives in each dyno's memory: with more than one web dyno, or across a restart, calls are only spaced per dyno.
 
@@ -210,7 +210,8 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - Space Pinboard calls for the same user three seconds apart, per Pinboard's guidance (`PINBOARD_MIN_INTERVAL_MS`, `PINBOARD_MAX_QUEUE_MS`)
 - Read preview pages only as far as `</head>`, under one 5-second deadline for the whole fetch
 - Harden the preview fetcher's SSRF guard: refuse hostnames that resolve to private addresses, redirects to private hosts, and `0.0.0.0/8`, `100.64.0.0/10`, reserved, benchmarking and multicast IPv4, link-local, site-local and multicast IPv6, and IPv6 forms that embed an IPv4 address (mapped, compatible, NAT64, 6to4, Teredo)
-- Hang up on a preview page once its head has been read or it turns out not to be HTML
+- Hang up on a preview page once its head has been read, or as soon as it turns out to be an error or not HTML
+- Key the `/preview` and `/posts/suggest-with-preview` rate limits on the client IP, since the `Authorization` header isn't checked there
 - Only return http(s) links in previews; resolve relative links and take the site domain from the page actually fetched
 - Log how long Pinboard and the preview fetch each took, with usernames stripped of characters that could forge log lines
 - Drop a queued Pinboard call if the client has already disconnected (giving its slot to the next call), and cap queueing plus the Pinboard call at 25 seconds
