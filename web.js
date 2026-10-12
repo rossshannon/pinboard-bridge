@@ -27,7 +27,17 @@ const CORS_PREFLIGHT_MAX_AGE_SECONDS = 24 * 60 * 60;
 // which works out at 300 per 15 minutes. Match that, rather than imposing a
 // tighter ceiling that a single bookmarking session can trip.
 const IP_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
-const IP_RATE_LIMIT_MAX = Number.parseInt(process.env.IP_RATE_LIMIT_MAX, 10) || 300;
+// A rate limit from the environment must be a plain positive integer.
+// Anything else (0, -1, 1e3, a typo) falls back to the default with a warning
+// rather than silently blocking every request or allowing one.
+const readRateLimit = (name, fallback) => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  if (/^\d+$/.test(raw.trim()) && Number(raw) > 0) return Number(raw);
+  console.warn(`Ignoring ${name}=${JSON.stringify(raw)}: expected a positive integer. Using ${fallback}.`);
+  return fallback;
+};
+const IP_RATE_LIMIT_MAX = readRateLimit('IP_RATE_LIMIT_MAX', 300);
 
 // Log startup configuration
 console.log(`Starting Pinboard Bridge in ${NODE_ENV} mode`);
@@ -419,7 +429,7 @@ const fetchPreview = async targetUrl => {
 // Pinboard's published policy is one call per user per 3 seconds, so 20/min
 // is the maximum sustained rate their /posts/suggest endpoint will accept
 // before rate-limiting drops requests (observed as silent TCP hang-ups).
-const PREVIEW_RATE_LIMIT_MAX = Number.parseInt(process.env.PREVIEW_RATE_LIMIT_MAX, 10) || 20;
+const PREVIEW_RATE_LIMIT_MAX = readRateLimit('PREVIEW_RATE_LIMIT_MAX', 20);
 const previewRateLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: PREVIEW_RATE_LIMIT_MAX,
