@@ -66,6 +66,14 @@ const call = (pathAndQuery, user = 'alice') => fetch(`${baseUrl()}${pathAndQuery
   headers: { Authorization: basic(user) }
 });
 
+// Wait until Pinboard has seen a call, so the next request queues behind it
+// whatever order the client's sockets deliver them in.
+const firstPinboardCall = async () => {
+  while (!calls.some(c => c.url.includes('api.pinboard.in'))) {
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+};
+
 const htmlResponse = (config, data) => ({
   data,
   status: 200,
@@ -242,6 +250,7 @@ test('a username cannot forge extra log lines or fields', async () => {
 
 test('a queued call is dropped if the client has gone by its turn', async () => {
   const first = call('/v1/posts/get?format=json&url=1');
+  await firstPinboardCall();
   const controller = new AbortController();
   const second = fetch(`${baseUrl()}/v1/posts/get?format=json&url=2`, {
     headers: { Authorization: basic('alice') },
@@ -258,6 +267,7 @@ test('a queued call is dropped if the client has gone by its turn', async () => 
 test('a dropped call gives its slot back to the next one', async () => {
   const startedAt = Date.now();
   const first = call('/v1/posts/get?format=json&url=1');
+  await firstPinboardCall();
   const controller = new AbortController();
   const dropped = fetch(`${baseUrl()}/v1/posts/get?format=json&url=2`, {
     headers: { Authorization: basic('alice') },
