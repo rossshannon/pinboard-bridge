@@ -264,7 +264,7 @@ test('a malformed path gets a JSON 400, not Express\'s HTML error page', async (
   assert.equal(res.status, 400);
   assert.match(res.headers.get('content-type') || '', /application\/json/);
   const body = await res.json();
-  assert.equal(body.error, 'Bad request');
+  assert.equal(body.error, 'Bad Request');
 });
 
 test('returns 500 on an upstream error with no response and an unrecognised code', async () => {

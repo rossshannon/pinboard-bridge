@@ -27,17 +27,20 @@ const CORS_PREFLIGHT_MAX_AGE_SECONDS = 24 * 60 * 60;
 // which works out at 300 per 15 minutes. Match that, rather than imposing a
 // tighter ceiling that a single bookmarking session can trip.
 const IP_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
-// A rate limit from the environment must be a plain positive integer.
-// Anything else (0, -1, 1e3, a typo) falls back to the default with a warning
-// rather than silently blocking every request or allowing one.
-const readRateLimit = (name, fallback) => {
+// Read a whole-number setting. Anything else ("-1", "1e3", "300ms", or digits
+// too long to be exact) falls back to the default with a warning, rather than
+// being half-parsed. (Same helper as #4's, so the two merge cleanly.)
+const parseIntSetting = (name, fallback, { min }) => {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
-  if (/^\d+$/.test(raw.trim()) && Number(raw) > 0) return Number(raw);
-  console.warn(`Ignoring ${name}=${JSON.stringify(raw)}: expected a positive integer. Using ${fallback}.`);
+  const trimmed = String(raw).trim();
+  const parsed = /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
+  if (Number.isSafeInteger(parsed) && parsed >= min) return parsed;
+  console.warn(`Ignoring ${name}=${JSON.stringify(raw)}: expected a whole number of at least ${min}. Using ${fallback}.`);
   return fallback;
 };
-const IP_RATE_LIMIT_MAX = readRateLimit('IP_RATE_LIMIT_MAX', 300);
+const parsePositiveInt = (name, fallback) => parseIntSetting(name, fallback, { min: 1 });
+const IP_RATE_LIMIT_MAX = parsePositiveInt('IP_RATE_LIMIT_MAX', 300);
 
 // Log startup configuration
 console.log(`Starting Pinboard Bridge in ${NODE_ENV} mode`);
@@ -115,7 +118,7 @@ const jsonErrorHandler = (err, req, res, next) => {
   }
   const status = err.status || err.statusCode;
   if (status >= 400 && status < 500) {
-    return res.status(status).json({ error: 'Bad request' });
+    return res.status(status).json({ error: http.STATUS_CODES[status] || 'Bad Request' });
   }
   console.error('Unhandled error:', err.message);
   return res.status(500).json({ error: 'Internal server error' });
@@ -441,7 +444,7 @@ const fetchPreview = async targetUrl => {
 // Pinboard's published policy is one call per user per 3 seconds, so 20/min
 // is the maximum sustained rate their /posts/suggest endpoint will accept
 // before rate-limiting drops requests (observed as silent TCP hang-ups).
-const PREVIEW_RATE_LIMIT_MAX = readRateLimit('PREVIEW_RATE_LIMIT_MAX', 20);
+const PREVIEW_RATE_LIMIT_MAX = parsePositiveInt('PREVIEW_RATE_LIMIT_MAX', 20);
 const previewRateLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: PREVIEW_RATE_LIMIT_MAX,
@@ -668,4 +671,4 @@ const shutdown = () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-module.exports = { app, server };
+module.exports = { app, server, parseIntSetting, jsonErrorHandler };

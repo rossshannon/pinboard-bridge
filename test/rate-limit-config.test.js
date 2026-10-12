@@ -34,3 +34,14 @@ test('a malformed IP_RATE_LIMIT_MAX falls back to the default instead of being m
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('ratelimit-limit'), '300');
 });
+
+test('a limit too long to be an exact integer falls back to the default', () => {
+  const { parseIntSetting } = require('../web.js');
+  process.env.TEST_HUGE_LIMIT = '9'.repeat(400);
+  assert.equal(parseIntSetting('TEST_HUGE_LIMIT', 300, { min: 1 }), 300);
+  process.env.TEST_HUGE_LIMIT = '0';
+  assert.equal(parseIntSetting('TEST_HUGE_LIMIT', 300, { min: 1 }), 300);
+  process.env.TEST_HUGE_LIMIT = ' 42 ';
+  assert.equal(parseIntSetting('TEST_HUGE_LIMIT', 300, { min: 1 }), 42);
+  delete process.env.TEST_HUGE_LIMIT;
+});
