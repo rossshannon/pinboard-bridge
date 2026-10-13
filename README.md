@@ -43,10 +43,10 @@ cp .env.example .env
 | `IP_RATE_LIMIT_MAX` | Requests allowed per source IP per 15 minutes on `/v1/*` | 300 | No |
 | `PREVIEW_RATE_LIMIT_MAX` | `/posts/suggest-with-preview` requests allowed per token per minute | 20 | No |
 
-**CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` defaults to the Pincushion frontend at `https://rossshannon.github.com`:
+**CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` defaults to the Pincushion frontend at `https://rossshannon.github.io`:
 
 ```bash
-ALLOWED_ORIGINS=https://rossshannon.github.com
+ALLOWED_ORIGINS=https://rossshannon.github.io
 ```
 
 ### Authentication Policy
@@ -74,7 +74,7 @@ ALLOWED_ORIGINS=https://rossshannon.github.com
 ```bash
 npm run dev
 # or specify env vars
-PORT=1337 ALLOWED_ORIGINS=https://rossshannon.github.com npm start
+PORT=1337 ALLOWED_ORIGINS=https://rossshannon.github.io npm start
 ```
 
 Health check:
@@ -87,7 +87,7 @@ Proxy usage example (Pinboard “all posts” endpoint using an auth token expos
 
 ```bash
 curl \
-  -H "Origin: https://rossshannon.github.com" \
+  -H "Origin: https://rossshannon.github.io" \
   -H "Authorization: Bearer username:YOURTOKEN" \
   "http://localhost:1337/v1/posts/all?format=json"
 ```
@@ -191,6 +191,13 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - `Cache-Control: no-store` on every response, no ETags, so account data never lands in a browser cache
 
 ## Changelog
+
+### Version 2.2.1
+- Mount the per-IP limiter after CORS, so a 429 carries `Access-Control-Allow-Origin` and browsers can read it instead of seeing a network error; expose the `RateLimit-*` and `Retry-After` headers to browser clients
+- Report `EAI_AGAIN`, `EHOSTUNREACH` and `ENETUNREACH` from Pinboard as 503 alongside the other network-layer failures, and a socket-level `ETIMEDOUT` as 504 like the existing request timeout
+- Add a final JSON error handler, so an error after the CORS check (for example from the rate limiter) never returns Express's HTML error page; client errors keep their status and its standard text
+- Correct the documented `ALLOWED_ORIGINS` to Pincushion's real origin, `https://rossshannon.github.io` (it said `.github.com`, which blocks Pincushion), and set it in `app.json`
+- Reject non-integer, non-positive or too-large `IP_RATE_LIMIT_MAX`/`PREVIEW_RATE_LIMIT_MAX` with a startup warning instead of misreading them
 
 ### Version 2.2.0
 - Move to the Heroku-26 stack (Ubuntu 26.04, supported until April 2031); `heroku.yml` and the new `app.json` both declare `heroku-26`

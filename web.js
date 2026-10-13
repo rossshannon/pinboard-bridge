@@ -27,7 +27,20 @@ const CORS_PREFLIGHT_MAX_AGE_SECONDS = 24 * 60 * 60;
 // which works out at 300 per 15 minutes. Match that, rather than imposing a
 // tighter ceiling that a single bookmarking session can trip.
 const IP_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
-const IP_RATE_LIMIT_MAX = Number.parseInt(process.env.IP_RATE_LIMIT_MAX, 10) || 300;
+// Read a whole-number setting. Anything else ("-1", "1e3", "300ms", or digits
+// too long to be exact) falls back to the default with a warning, rather than
+// being half-parsed. (Same helper as #4's, so the two merge cleanly.)
+const parseIntSetting = (name, fallback, { min }) => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const trimmed = String(raw).trim();
+  const parsed = /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
+  if (Number.isSafeInteger(parsed) && parsed >= min) return parsed;
+  console.warn(`Ignoring ${name}=${JSON.stringify(raw)}: expected a whole number of at least ${min}. Using ${fallback}.`);
+  return fallback;
+};
+const parsePositiveInt = (name, fallback) => parseIntSetting(name, fallback, { min: 1 });
+const IP_RATE_LIMIT_MAX = parsePositiveInt('IP_RATE_LIMIT_MAX', 300);
 
 // Log startup configuration
 console.log(`Starting Pinboard Bridge in ${NODE_ENV} mode`);
@@ -63,20 +76,6 @@ app.use(helmet({
 // shrinks by roughly 80%.
 app.use(compression());
 
-// Rate limiting per IP for the generic proxy routes. CORS preflights are
-// skipped: they never reach Pinboard, and counting them would halve the
-// number of real requests a browser client could make.
-const limiter = rateLimit({
-  windowMs: IP_RATE_LIMIT_WINDOW_MS,
-  max: IP_RATE_LIMIT_MAX,
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
-  message: { error: 'Too many requests, please try again later.' },
-  skip: req => req.method === 'OPTIONS',
-});
-
-app.use('/v1/', limiter);
-
 // CORS configuration
 const corsOptions = {
   origin: (origin, callback) => {
@@ -96,6 +95,8 @@ const corsOptions = {
   credentials: true,
   methods: ['GET', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Requested-With', 'X-HTTP-Method-Override', 'Origin', 'Accept', 'Authorization'],
+  // Let browser clients read the throttle state the limiters report.
+  exposedHeaders: ['RateLimit-Policy', 'RateLimit-Limit', 'RateLimit-Remaining', 'RateLimit-Reset', 'Retry-After'],
   maxAge: CORS_PREFLIGHT_MAX_AGE_SECONDS,
 };
 
@@ -104,15 +105,45 @@ app.use(cors(corsOptions));
 // Respond immediately to CORS preflight checks
 app.options('*', cors(corsOptions));
 
-// Surface CORS rejections as JSON 403 errors
-app.use((err, req, res, next) => {
+// Turn any error into a JSON response: CORS rejections become 403, client
+// errors Express flags itself (such as a malformed percent-encoded path) keep
+// their 4xx status, and everything else is a 500. Mounted twice, here and
+// after the routes, so nothing falls through to Express's HTML error page.
+const jsonErrorHandler = (err, req, res, next) => {
+  if (res.headersSent) {
+    return next(err);
+  }
   if (err.message === 'Not allowed by CORS') {
     return res.status(403).json({ error: 'Origin not allowed by CORS policy' });
   }
-
-  console.error('Middleware error:', err.message);
+  const status = err.status || err.statusCode;
+  if (status >= 400 && status < 500) {
+    return res.status(status).json({ error: http.STATUS_CODES[status] || 'Bad Request' });
+  }
+  console.error('Unhandled error:', err.message);
   return res.status(500).json({ error: 'Internal server error' });
+};
+
+app.use(jsonErrorHandler);
+
+// Rate limiting per IP for the generic proxy routes. This sits after cors()
+// so a 429 still carries Access-Control-Allow-Origin; mounted before it, a
+// browser sees a throttle as an opaque network error and can't read the
+// JSON body or RateLimit-* headers. CORS preflights must never count: they
+// never reach Pinboard, and counting them would halve the number of real
+// requests a browser client could make. cors() already ends them above; the
+// skip keeps that true if the order changes again. Requests from disallowed
+// origins also stop above, with a 403, and never reach Pinboard either.
+const limiter = rateLimit({
+  windowMs: IP_RATE_LIMIT_WINDOW_MS,
+  max: IP_RATE_LIMIT_MAX,
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  message: { error: 'Too many requests, please try again later.' },
+  skip: req => req.method === 'OPTIONS',
 });
+
+app.use('/v1/', limiter);
 
 // XML parser configuration
 const xmlParser = new XMLParser({
@@ -121,6 +152,20 @@ const xmlParser = new XMLParser({
 });
 
 const USER_AGENT = 'pinboard-bridge/2.0 (+https://github.com/rossshannon/pinboard-bridge)';
+
+// Errors that mean the request never got an HTTP answer from Pinboard: DNS
+// (including the transient EAI_AGAIN), no route, refused, or a dropped
+// socket. These are reported as 503 rather than a generic 500. A socket-level
+// ETIMEDOUT is a timeout like axios's own ECONNABORTED, so both get 504.
+const UPSTREAM_TIMEOUT_CODES = new Set(['ECONNABORTED', 'ETIMEDOUT']);
+const UPSTREAM_UNREACHABLE_CODES = new Set([
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+]);
 
 // Axios configuration with timeout
 const apiRequestDefaults = {
@@ -399,7 +444,7 @@ const fetchPreview = async targetUrl => {
 // Pinboard's published policy is one call per user per 3 seconds, so 20/min
 // is the maximum sustained rate their /posts/suggest endpoint will accept
 // before rate-limiting drops requests (observed as silent TCP hang-ups).
-const PREVIEW_RATE_LIMIT_MAX = Number.parseInt(process.env.PREVIEW_RATE_LIMIT_MAX, 10) || 20;
+const PREVIEW_RATE_LIMIT_MAX = parsePositiveInt('PREVIEW_RATE_LIMIT_MAX', 20);
 const previewRateLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: PREVIEW_RATE_LIMIT_MAX,
@@ -480,7 +525,7 @@ app.get('/posts/suggest-with-preview', previewRateLimiter, async (req, res) => {
       suggestionsStatus = 'error';
       if (upstreamStatus) {
         suggestionsError = `Pinboard suggest returned ${upstreamStatus}`;
-      } else if (error.code === 'ECONNABORTED') {
+      } else if (UPSTREAM_TIMEOUT_CODES.has(error.code)) {
         suggestionsError = 'Pinboard suggest timed out';
       } else {
         suggestionsError = error.message || 'Pinboard suggest failed';
@@ -576,13 +621,13 @@ app.get('/v1/*', async (req, res) => {
     }
 
     // Handle timeout errors
-    if (error.code === 'ECONNABORTED') {
+    if (UPSTREAM_TIMEOUT_CODES.has(error.code)) {
       console.error('Request timeout:', error.message);
       return res.status(504).json({ error: 'Gateway timeout' });
     }
 
     // Handle network-layer errors (DNS failure, connection refused, reset)
-    if (['ENOTFOUND', 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET'].includes(error.code)) {
+    if (UPSTREAM_UNREACHABLE_CODES.has(error.code)) {
       console.error('Pinboard API unreachable:', error.message);
       return res.status(503).json({ error: 'Pinboard API is unreachable' });
     }
@@ -597,6 +642,10 @@ app.get('/v1/*', async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
+
+// The same handler again, for errors raised after the first mount: the rate
+// limiter's store, routing (a malformed path), or a route itself.
+app.use(jsonErrorHandler);
 
 // Start server
 server.listen(PORT, () => {
@@ -622,4 +671,4 @@ const shutdown = () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-module.exports = { app, server };
+module.exports = { app, server, parseIntSetting, jsonErrorHandler };
