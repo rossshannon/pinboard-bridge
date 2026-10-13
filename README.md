@@ -216,13 +216,19 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - Tell clients only what kind of preview failure happened, keeping network error detail in the logs
 - Give each Pinboard call a deadline for the whole response, not just for gaps in it (`PINBOARD_TOTAL_BUDGET_MS`, at least 1000 ms)
 - Ignore numeric settings that aren't whole numbers, with a warning, instead of half-parsing them
-- Correct the documented `ALLOWED_ORIGINS` for Pincushion to `https://rossshannon.github.io`
 - Harden the preview fetcher's SSRF guard: refuse hostnames that resolve to private addresses, redirects to private hosts, and `0.0.0.0/8`, `100.64.0.0/10`, reserved, benchmarking and multicast IPv4, link-local, site-local and multicast IPv6, and IPv6 forms that embed an IPv4 address (mapped, compatible, NAT64, 6to4, Teredo)
 - Hang up on a preview page once its head has been read, or as soon as it turns out to be an error or not HTML
 - Key the `/preview` and `/posts/suggest-with-preview` rate limits on the client IP, since the `Authorization` header isn't checked there
 - Only return http(s) links in previews; resolve relative links and take the site domain from the page actually fetched
 - Log how long Pinboard and the preview fetch each took, with usernames stripped of characters that could forge log lines
 - Drop a queued Pinboard call as soon as its client disconnects, moving the calls behind it up the queue, and cap queueing plus the Pinboard call at 25 seconds
+
+### Version 2.2.1
+- Mount the per-IP limiter after CORS, so a 429 carries `Access-Control-Allow-Origin` and browsers can read it instead of seeing a network error; expose the `RateLimit-*` and `Retry-After` headers to browser clients
+- Report `EAI_AGAIN`, `EHOSTUNREACH` and `ENETUNREACH` from Pinboard as 503 alongside the other network-layer failures, and a socket-level `ETIMEDOUT` as 504 like the existing request timeout
+- Add a final JSON error handler, so an error after the CORS check (for example from the rate limiter) never returns Express's HTML error page; client errors keep their status and its standard text
+- Correct the documented `ALLOWED_ORIGINS` to Pincushion's real origin, `https://rossshannon.github.io` (it said `.github.com`, which blocks Pincushion), and set it in `app.json`
+- Reject non-integer, non-positive or too-large `IP_RATE_LIMIT_MAX`/`PREVIEW_RATE_LIMIT_MAX` with a startup warning instead of misreading them
 
 ### Version 2.2.0
 - Move to the Heroku-26 stack (Ubuntu 26.04, supported until April 2031); `heroku.yml` and the new `app.json` both declare `heroku-26`

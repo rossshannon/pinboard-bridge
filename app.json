@@ -5,6 +5,7 @@
     "stack": "heroku-26",
     "buildpacks": [{ "url": "heroku/nodejs" }],
     "env": {
-        "NODE_ENV": { "value": "production" }
+        "NODE_ENV": { "value": "production" },
+        "ALLOWED_ORIGINS": { "value": "https://rossshannon.github.io" }
     }
 }
