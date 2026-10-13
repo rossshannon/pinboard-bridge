@@ -41,7 +41,13 @@ cp .env.example .env
 | `NODE_ENV` | Environment mode | development | No |
 | `ALLOWED_ORIGINS` | Comma-separated list of allowed CORS origins | (all origins) | No |
 | `IP_RATE_LIMIT_MAX` | Requests allowed per source IP per 15 minutes on `/v1/*` | 300 | No |
-| `PREVIEW_RATE_LIMIT_MAX` | `/posts/suggest-with-preview` requests allowed per token per minute | 20 | No |
+| `PREVIEW_RATE_LIMIT_MAX` | `/posts/suggest-with-preview` requests allowed per IP per minute | 20 | No |
+| `PAGE_PREVIEW_RATE_LIMIT_MAX` | `/preview` requests allowed per IP per minute | 60 | No |
+| `PINBOARD_MIN_INTERVAL_MS` | Minimum gap between the starts of two Pinboard calls for the same user (`0` turns spacing off) | 3000 | No |
+| `PINBOARD_MAX_QUEUE_MS` | Longest a call will wait for its slot; a call that would wait longer is sent straight away. Capped at the budget below minus 5 s | 9000 | No |
+| `PINBOARD_TOTAL_BUDGET_MS` | Longest a Pinboard call may take, queueing included, before the bridge answers 504 (at least 1000) | 25000 | No |
+
+Numeric settings must be whole numbers; anything else (`-1`, `1e3`, `300ms`) is ignored with a warning and the default is used.
 
 **CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` defaults to the Pincushion frontend at `https://rossshannon.github.io`:
 
@@ -61,7 +67,9 @@ ALLOWED_ORIGINS=https://rossshannon.github.io
 - 300 requests per 15 minutes are allowed per source IP on `/v1/*`. This mirrors Pinboard's published guidance of one call per user per three seconds. Heroku users should ensure `app.set('trust proxy', 1)` remains enabled so the limiter sees client IPs.
 - CORS preflight (`OPTIONS`) requests are not counted. Browsers must preflight every call because of the `Authorization` header, so counting them would halve the usable budget.
 - When throttled, responses include standard `RateLimit-*` headers so the UI can surface “retry-after” information.
-- `/posts/suggest-with-preview` adds a per-token limiter (20 requests/minute) to prevent abusive preview scraping and to stay within Pinboard's own limits.
+- `/posts/suggest-with-preview` adds a per-IP limiter (20 requests/minute) to prevent abusive preview scraping and to stay within Pinboard's own limits. `/preview` makes no Pinboard call, so its limit is looser (60 requests/minute per IP). Both also count against the per-IP limit above. They are keyed on the IP rather than the `Authorization` header, which isn't checked against Pinboard on these routes, so changing the header doesn't buy a fresh allowance.
+- `/preview` only checks that an `Authorization` header is well formed; it doesn't ask Pinboard whether the credentials are real, since that would cost a Pinboard call. Anyone can use it as a page-head fetcher within the per-IP limit.
+- Pinboard asks for at most one call per user every three seconds. The bridge spaces calls for the same user that far apart (start to start) by holding a later call until its slot. A call that would have to wait more than `PINBOARD_MAX_QUEUE_MS` is sent straight away instead, so a burst never queues towards Heroku's 30-second router timeout, and time spent waiting is taken off the call's 25-second Pinboard budget, leaving room inside the router timeout. If the client disconnects while its call is queued, the call is dropped rather than sent. Slots are keyed on the whole `Authorization` header, so a request with someone else's username and a wrong token can't use up their slots. Spacing lives in each dyno's memory: with more than one web dyno, or across a restart, calls are only spaced per dyno.
 
 ### Response Compression and Preflight Caching
 
@@ -98,9 +106,16 @@ curl \
 |--------|------|-------------|
 | `GET` | `/health` | Returns service status, uptime, and timestamp. Useful for uptime monitors. |
 | `GET` | `/v1/*` | Forwards requests to `https://api.pinboard.in` with the same path/query, after injecting auth info and normalizing responses. |
-| `GET` | `/posts/suggest-with-preview` | Calls Pinboard’s `posts/suggest` and, in parallel, fetches preview metadata (Twitter Card/Open Graph) for the supplied URL. |
+| `GET` | `/preview` | Fetches preview metadata (Twitter Card/Open Graph) for the supplied URL. Makes no Pinboard call. |
+| `GET` | `/posts/suggest-with-preview` | Calls Pinboard’s `posts/suggest` and, in parallel, fetches preview metadata for the supplied URL. Answers once both are done; kept for older clients. |
 
 Responses default to JSON. If Pinboard returns XML (the default), the bridge converts it to JSON via `fast-xml-parser` before sending the response back to the browser.
+
+### `/preview`
+
+Returns the `preview`, `previewStatus` and `previewError` fields described below, without the Pinboard suggestions. It takes the same `url` parameter and `Authorization` header as `/posts/suggest-with-preview`. Pinboard's `posts/suggest` can take 15 seconds or more for a URL it hasn't seen before, so clients that show a preview should call this and `/v1/posts/suggest` separately rather than wait on the combined route.
+
+The bridge reads the page only as far as `</head>` (or 512 KB), and gives up on the whole fetch, redirects included, after 5 seconds.
 
 ### `/posts/suggest-with-preview`
 
@@ -142,8 +157,10 @@ This endpoint keeps preview scraping on the server (no extra browser permissions
 
 **Limits & logging**
 
-- Preview fetches are limited to 30 requests per minute per Authorization token.
-- Each request logs `{user, targetHost, outcome}` (`preview_generated`, `preview_not_found`, or `preview_failed`) to help spot misuse without storing the raw token.
+- Preview fetches are limited to 20 requests per minute per IP on this route (`PREVIEW_RATE_LIMIT_MAX`), and 60 on `/preview`.
+- A failed preview tells the client only what kind of failure it was (`Preview fetch timed out`, `Preview response is not HTML`, `URL host is not reachable from the proxy`, `Page returned HTTP 404`, or `Could not fetch the page`). The underlying error goes to the logs only, so the route can't be used to probe what the dyno can reach.
+- Each request logs `{user, targetHost, outcome}` (`preview_generated`, `preview_not_found`, or `preview_failed`) to help spot misuse without storing the raw token, plus `suggestMs` and `previewMs`: how long each half took, as the user saw it (`suggestMs` includes any time spent waiting for the user's Pinboard slot).
+- Every Pinboard call also logs a `[pinboard]` line with the endpoint, `waitMs` (time held for the user's slot) and `upstreamMs` (time Pinboard took).
 
 ## Deployment
 
@@ -185,12 +202,26 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - CORS origin validation with explicit 403 JSON responses for disallowed origins
 - Rate limiting per IP (300 per 15 minutes on `/v1/*`)
 - Per-token preview throttling and structured preview logging
-- 30-second request timeout
+- 25-second budget for each Pinboard call, queueing included
 - Sanitized error messages without leaking upstream responses
 - Authorization headers only (tokens never logged in URLs)
 - `Cache-Control: no-store` on every response, no ETags, so account data never lands in a browser cache
 
 ## Changelog
+
+### Version 2.3.0
+- Add `/preview`, which returns page metadata without waiting on Pinboard's `posts/suggest`
+- Space Pinboard calls for the same user three seconds apart, per Pinboard's guidance (`PINBOARD_MIN_INTERVAL_MS`, `PINBOARD_MAX_QUEUE_MS`)
+- Read preview pages only as far as `</head>` (or `<body>`, for pages that leave the closing tag out, skipping look-alikes inside scripts, styles, titles, comments and nested templates), under one 5-second deadline for the whole fetch
+- Tell clients only what kind of preview failure happened, keeping network error detail in the logs
+- Give each Pinboard call a deadline for the whole response, not just for gaps in it (`PINBOARD_TOTAL_BUDGET_MS`, at least 1000 ms)
+- Ignore numeric settings that aren't whole numbers, with a warning, instead of half-parsing them
+- Harden the preview fetcher's SSRF guard: refuse hostnames that resolve to private addresses, redirects to private hosts, and `0.0.0.0/8`, `100.64.0.0/10`, reserved, benchmarking and multicast IPv4, link-local, site-local and multicast IPv6, and IPv6 forms that embed an IPv4 address (mapped, compatible, NAT64, 6to4, Teredo)
+- Hang up on a preview page once its head has been read, or as soon as it turns out to be an error or not HTML
+- Key the `/preview` and `/posts/suggest-with-preview` rate limits on the client IP, since the `Authorization` header isn't checked there
+- Only return http(s) links in previews; resolve relative links and take the site domain from the page actually fetched
+- Log how long Pinboard and the preview fetch each took, with usernames stripped of characters that could forge log lines
+- Drop a queued Pinboard call as soon as its client disconnects, moving the calls behind it up the queue, and cap queueing plus the Pinboard call at 25 seconds
 
 ### Version 2.2.1
 - Mount the per-IP limiter after CORS, so a 429 carries `Access-Control-Allow-Origin` and browsers can read it instead of seeing a network error; expose the `RateLimit-*` and `Retry-After` headers to browser clients

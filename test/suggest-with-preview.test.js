@@ -86,6 +86,9 @@ axios.defaults.adapter = async (config) => {
 };
 
 process.env.PORT = '0';
+// These suites make many Pinboard calls as one user; spacing them 3s apart
+// would only slow the suite down. Spacing has its own tests.
+process.env.PINBOARD_MIN_INTERVAL_MS = '0';
 // This suite issues ~20 requests with a shared Authorization header; the
 // production-safe 20/min preview limit would 429 the bulk of them.
 process.env.PREVIEW_RATE_LIMIT_MAX = '10000';

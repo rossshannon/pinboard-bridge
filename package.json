@@ -1,7 +1,7 @@
 {
     "private": "true",
     "name": "pinboard-bridge",
-    "version": "2.2.1",
+    "version": "2.3.0",
     "description": "Pinboard API proxy service",
     "main": "web.js",
     "scripts": {
