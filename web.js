@@ -396,23 +396,23 @@ const decodeBasicCredentials = encoded => {
 // keep them to characters that can't forge a line or a field.
 const logSafeIdentity = value => String(value || '').replace(/[^\w.@+-]/g, '?').slice(0, 64) || 'unknown';
 
-// The path of a /v1/ call goes into log lines too.
-const logSafeLabel = value => String(value || '').replace(/[^\w./-]/g, '?').slice(0, 64) || 'unknown';
+// The only paths forwarded to Pinboard: /v1/ followed by plain segments
+// (letters, digits, "_" and "-"), which covers every Pinboard API method.
+// No dots and no percent-escapes means no dot segments ("/v1/../x",
+// "/v1/%2e%2e/x", "/v1/..%2fx") for the HTTP client or Pinboard's own server
+// to resolve to somewhere outside /v1/.
+const PINBOARD_V1_PATH = /^\/v1\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*\/?$/;
+const isPinboardV1Path = path => PINBOARD_V1_PATH.test(path);
 
-// True when a request path still points under /v1/ on Pinboard's host after
-// the URL parser has resolved it the way the HTTP client will.
-const isPinboardV1Path = path => {
-  try {
-    const resolved = new URL(`${PINBOARD_BASE_URL}${path}`);
-    return resolved.origin === PINBOARD_BASE_URL && resolved.pathname.startsWith('/v1/');
-  } catch (err) {
-    return false;
-  }
-};
+// True for a query key Pinboard might read as auth_token: the plain name, or
+// an array or PHP-style spelling of it ("auth_token[]", "auth.token").
+const isAuthTokenKey = key => /^auth[_. ]token(?:\[|$)/i.test(key.trim());
 
 const applyAuthContext = (req, queryParams) => {
   if (queryParams) {
-    queryParams.delete('auth_token');
+    for (const key of [...queryParams.keys()]) {
+      if (isAuthTokenKey(key)) queryParams.delete(key);
+    }
   }
 
   const authHeader = req.get('authorization') || '';
@@ -766,25 +766,37 @@ const createHeadEndScanner = () => {
   };
 };
 
-// Turn the bytes of a page's head into text using the encoding the page
-// declares: a byte-order mark first, then the Content-Type header, then a
-// <meta charset> (or http-equiv) tag, and UTF-8 if none of those says. Without
-// this a Shift_JIS or windows-1252 page comes out as mojibake.
-const META_CHARSET = /<meta\b[^>]*?\bcharset\s*=\s*["']?\s*([\w.:-]+)/i;
+// Turn the bytes of a page's head into text. Most pages are UTF-8 whatever
+// they claim, so bytes that are valid UTF-8 are read as UTF-8. Only when they
+// are not does the declared encoding decide: the Content-Type header, then a
+// <meta charset> or http-equiv tag. Without this a Shift_JIS or windows-1252
+// page comes out as mojibake.
+const declaredMetaCharset = buffer => {
+  // Parsed, not pattern-matched: comments and other attributes can mention a
+  // charset too. latin1 keeps every byte, and the tags we want are ASCII.
+  const $ = cheerio.load(buffer.toString('latin1'));
+  const direct = $('meta[charset]').first().attr('charset');
+  if (direct && direct.trim()) return direct.trim();
+  let found = null;
+  $('meta[http-equiv]').each((index, element) => {
+    if (found || String($(element).attr('http-equiv')).trim().toLowerCase() !== 'content-type') return;
+    found = /charset\s*=\s*["']?\s*([\w.:-]+)/i.exec($(element).attr('content') || '')?.[1] || null;
+  });
+  return found;
+};
+
 const decodeHead = (buffer, contentType = '') => {
-  let charset = null;
-  if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) charset = 'utf-8';
-  else if (buffer[0] === 0xff && buffer[1] === 0xfe) charset = 'utf-16le';
-  else if (buffer[0] === 0xfe && buffer[1] === 0xff) charset = 'utf-16be';
-  if (!charset) {
-    charset = /charset\s*=\s*["']?\s*([\w.:-]+)/i.exec(contentType)?.[1] || null;
+  if (buffer[0] === 0xff && buffer[1] === 0xfe) return new TextDecoder('utf-16le').decode(buffer);
+  if (buffer[0] === 0xfe && buffer[1] === 0xff) return new TextDecoder('utf-16be').decode(buffer);
+  try {
+    // `stream` lets a character cut off at the very end of the bytes pass.
+    return new TextDecoder('utf-8', { fatal: true }).decode(buffer, { stream: true });
+  } catch (err) {
+    // Not UTF-8: see what the page says it is.
   }
-  if (!charset) {
-    charset = META_CHARSET.exec(buffer.toString('latin1'))?.[1] || null;
-    // A tag we could read as ASCII can't really be UTF-16.
-    if (charset && /^utf-?16/i.test(charset)) charset = 'utf-8';
-  }
-  if (charset && !/^utf-?8$/i.test(charset)) {
+  const charset = /charset\s*=\s*["']?\s*([\w.:-]+)/i.exec(contentType)?.[1] || declaredMetaCharset(buffer);
+  // A tag we could read as ASCII can't really be UTF-16.
+  if (charset && !/^utf-?(8|16)/i.test(charset)) {
     try {
       return new TextDecoder(charset).decode(buffer);
     } catch (err) {
@@ -1114,9 +1126,7 @@ app.get('/v1/*', async (req, res) => {
     const path = req.path; // This includes /v1/...
     let url = `${PINBOARD_BASE_URL}${path}`;
 
-    // Dot segments ("/v1/../x", also as %2e%2e) are resolved by the HTTP
-    // client, which would let a request climb out of /v1/ on Pinboard's
-    // host. Only forward paths that are still under /v1/ once resolved.
+    // Checked before anything is sent: see PINBOARD_V1_PATH.
     if (!isPinboardV1Path(path)) {
       return res.status(400).json({ error: 'Invalid API path' });
     }
@@ -1127,7 +1137,7 @@ app.get('/v1/*', async (req, res) => {
     }
 
     // Make request to Pinboard API
-    const response = await pinboardGet(url, authContext, logSafeLabel(path.replace(/^\/v1\//, '')), clientGoneSignal(res));
+    const response = await pinboardGet(url, authContext, path.replace(/^\/v1\//, '').slice(0, 64), clientGoneSignal(res));
     const { data, status } = response;
 
     if (status !== 200) {
@@ -1224,4 +1234,4 @@ const queuedPinboardCalls = () => {
   return count;
 };
 
-module.exports = { app, server, decodeHead, isPinboardV1Path, extractPreviewMetadata, parseIntSetting, jsonErrorHandler, pinboardSettings, queuedPinboardCalls, isPrivateAddress, isPrivateHostname, guardRedirect, fetchPreview, readHead, addressGuard };
+module.exports = { app, server, decodeHead, isPinboardV1Path, isAuthTokenKey, extractPreviewMetadata, parseIntSetting, jsonErrorHandler, pinboardSettings, queuedPinboardCalls, isPrivateAddress, isPrivateHostname, guardRedirect, fetchPreview, readHead, addressGuard };

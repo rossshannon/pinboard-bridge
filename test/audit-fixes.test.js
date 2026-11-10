@@ -22,7 +22,7 @@ axios.defaults.adapter = async config => {
 
 process.env.PORT = '0';
 process.env.PINBOARD_MIN_INTERVAL_MS = '0';
-const { server, decodeHead, isPinboardV1Path, extractPreviewMetadata } = require('../web.js');
+const { server, decodeHead, isPinboardV1Path, isAuthTokenKey, extractPreviewMetadata } = require('../web.js');
 
 before(async () => {
   if (!server.listening) await new Promise(resolve => server.once('listening', resolve));
@@ -47,8 +47,16 @@ const rawGet = path => new Promise((resolve, reject) => {
   req.end();
 });
 
-for (const path of ['/v1/../v2/secret', '/v1/%2e%2e/v2/secret', '/v1/%2E%2E/v2/secret', '/v1/posts/../../x', '/v1/.%2e/x', '/v1/..']) {
-  test(`a path that climbs out of /v1/ is refused, not forwarded: ${path}`, async () => {
+const REFUSED_PATHS = [
+  '/v1/../v2/secret', '/v1/%2e%2e/v2/secret', '/v1/%2E%2E/v2/secret', '/v1/posts/../../x', '/v1/.%2e/x', '/v1/..',
+  // Dot segments joined by an encoded slash, which Pinboard's own server might resolve.
+  '/v1/..%2f..%2fx', '/v1/%2e%2e%2fx', '/v1/posts/get/..%2f..%2f..%2fadmin',
+  // Dot segments that would stay inside /v1/ are refused as well: one rule, no judgement calls.
+  '/v1/posts/../tags/get', '/v1/./tags/get', '/v1/%2e/tags/get',
+  '/v1/posts//get', '/v1//', '/v1/posts/get;x=1', '/v1/posts\\get'
+];
+for (const path of REFUSED_PATHS) {
+  test(`a path that is not plain /v1/ segments is refused, not forwarded: ${path}`, async () => {
     const res = await rawGet(`${path}?format=json`);
     assert.equal(res.status, 400);
     assert.deepEqual(res.body, { error: 'Invalid API path' });
@@ -56,15 +64,20 @@ for (const path of ['/v1/../v2/secret', '/v1/%2e%2e/v2/secret', '/v1/%2E%2E/v2/s
   });
 }
 
-test('dot segments that stay inside /v1/ still go through', async () => {
-  const res = await rawGet('/v1/posts/../tags/get?format=json');
+test('every real Pinboard API path is accepted, and sent as it came', async () => {
+  const methods = ['posts/update', 'posts/add', 'posts/delete', 'posts/get', 'posts/recent', 'posts/dates', 'posts/all',
+    'posts/suggest', 'tags/get', 'tags/delete', 'tags/rename', 'user/secret', 'user/api_token', 'notes/list',
+    'notes/8e5d6964bb810e0050b0'];
+  for (const method of methods) {
+    assert.equal(isPinboardV1Path(`/v1/${method}`), true, method);
+    assert.equal(isPinboardV1Path(`/v1/${method}/`), true, `${method}/`);
+  }
+  assert.equal(isPinboardV1Path('/v1/'), false);
+  assert.equal(isPinboardV1Path('/v2/posts/get'), false);
+  const res = await rawGet('/v1/notes/8e5d6964bb810e0050b0?format=json');
   assert.equal(res.status, 200);
-  assert.equal(captured.length, 1);
-  // The HTTP client resolves it to the same place the guard checked.
-  assert.equal(new URL(captured[0]).pathname, '/v1/tags/get');
-  assert.equal(isPinboardV1Path('/v1/tags/get'), true);
-  assert.equal(isPinboardV1Path('/v1/notes/8e5d6964bb810e0050b0'), true);
-  assert.equal(isPinboardV1Path('/v1/\\..\\..\\x'), false);
+  // The raw string handed to the HTTP client, not a re-parse of it.
+  assert.equal(captured[0].split('?')[0], 'https://api.pinboard.in/v1/notes/8e5d6964bb810e0050b0');
 });
 
 test('bracketed query keys reach Pinboard as they were sent', async () => {
@@ -77,9 +90,19 @@ test('bracketed query keys reach Pinboard as they were sent', async () => {
   assert.equal(sent.get('auth_token'), 'testuser:DEADBEEF');
 });
 
-test('an auth_token in the query is still dropped in favour of the header', async () => {
-  await rawGet('/v1/posts/get?format=json&auth_token=someone:ELSE');
-  assert.deepEqual(new URL(captured[0]).searchParams.getAll('auth_token'), ['testuser:DEADBEEF']);
+test('an auth_token in the query is still dropped in favour of the header, however it is spelt', async () => {
+  await rawGet('/v1/posts/get?format=json&auth_token=someone:ELSE&auth_token[]=a:B&auth_token[x]=c:D&auth%5ftoken=e:F&auth.token=g:H&AUTH_TOKEN=i:J&tag=keep');
+  const sent = new URL(captured[0]).searchParams;
+  assert.deepEqual([...sent.keys()].sort(), ['auth_token', 'format', 'tag']);
+  assert.deepEqual(sent.getAll('auth_token'), ['testuser:DEADBEEF']);
+  assert.equal(isAuthTokenKey('auth_tokens'), false);
+  assert.equal(isAuthTokenKey('my_auth_token'), false);
+});
+
+test('with Basic auth no auth_token of any spelling reaches Pinboard', async () => {
+  const basic = 'Basic ' + Buffer.from('testuser:DEADBEEF').toString('base64');
+  await fetch(`http://127.0.0.1:${server.address().port}/v1/posts/get?format=json&auth_token[]=someone:ELSE`, { headers: { Authorization: basic } });
+  assert.deepEqual([...new URL(captured[0]).searchParams.keys()], ['format']);
 });
 
 test('suggest-with-preview reports a network failure by kind, without the raw error', async () => {
@@ -91,33 +114,63 @@ test('suggest-with-preview reports a network failure by kind, without the raw er
   assert.doesNotMatch(JSON.stringify(res.body), /10\.1\.2\.3|ECONNREFUSED/);
 });
 
-test('decodeHead uses the charset from the Content-Type header', () => {
+const CAFE_1252 = Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x21]); // "café!" in windows-1252 / latin1
+
+test('decodeHead uses the Content-Type charset for bytes that are not UTF-8', () => {
   const bytes = Buffer.from([0x3c, 0x74, 0x69, 0x74, 0x6c, 0x65, 0x3e, 0x93, 0xfa, 0x96, 0x7b]); // <title>日本 in Shift_JIS
   assert.equal(decodeHead(bytes, 'text/html; charset=Shift_JIS'), '<title>日本');
   assert.equal(decodeHead(bytes, 'text/html; charset="shift_jis"'), '<title>日本');
 });
 
 test('decodeHead falls back to a <meta charset> or http-equiv tag', () => {
-  const cafe = Buffer.from([0x63, 0x61, 0x66, 0xe9]); // "café" in windows-1252
-  const viaMeta = Buffer.concat([Buffer.from('<meta charset="windows-1252"><title>'), cafe]);
-  assert.equal(decodeHead(viaMeta, 'text/html'), '<meta charset="windows-1252"><title>café');
-  const viaHttpEquiv = Buffer.concat([Buffer.from('<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1"><title>'), cafe]);
-  assert.match(decodeHead(viaHttpEquiv), /<title>café$/);
+  const viaMeta = Buffer.concat([Buffer.from('<meta charset="windows-1252"><title>'), CAFE_1252]);
+  assert.equal(decodeHead(viaMeta, 'text/html'), '<meta charset="windows-1252"><title>café!');
+  const viaHttpEquiv = Buffer.concat([Buffer.from('<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1"><title>'), CAFE_1252]);
+  assert.match(decodeHead(viaHttpEquiv), /<title>café!$/);
+  // The header wins over the tag, as it does in a browser.
+  const koi = Buffer.concat([Buffer.from('<meta charset="windows-1252"><title>'), Buffer.from([0xd0, 0xd2, 0x21])]);
+  assert.match(decodeHead(koi, 'text/html; charset=koi8-r'), /<title>пр!$/);
 });
 
-test('decodeHead defaults to UTF-8, honours a byte-order mark, and survives an unknown charset', () => {
-  const utf8 = Buffer.from('<title>café ✓</title>');
-  assert.equal(decodeHead(utf8, 'text/html'), '<title>café ✓</title>');
-  assert.equal(decodeHead(utf8, 'text/html; charset=utf8'), '<title>café ✓</title>');
-  assert.equal(decodeHead(utf8, 'text/html; charset=klingon-1'), '<title>café ✓</title>');
-  // The mark wins over a header that says otherwise, and is not part of the text.
-  const withBom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), utf8]);
-  assert.equal(decodeHead(withBom, 'text/html; charset=iso-8859-1'), '<title>café ✓</title>');
+test('decodeHead reads valid UTF-8 as UTF-8 whatever else mentions a charset', () => {
+  const expectUtf8 = (html, contentType = 'text/html') => assert.match(decodeHead(Buffer.from(html), contentType), /café ✓/, html);
+  expectUtf8('<title>café ✓</title>');
+  expectUtf8('<title>café ✓</title>', 'text/html; charset=utf8');
+  // A server with a wrong default charset header in front of a UTF-8 page.
+  expectUtf8('<meta charset="utf-8"><title>café ✓</title>', 'text/html; charset=ISO-8859-1');
+  expectUtf8('<!-- <meta charset="iso-8859-1"> --><meta charset="utf-8"><title>café ✓</title>');
+  expectUtf8('<meta name="description" content="set charset=latin1 in mysql"><title>café ✓</title>');
+  expectUtf8('<meta name="x" data-charset="koi8-r"><title>café ✓</title>');
+  // The byte-order mark is not part of the text.
+  assert.equal(decodeHead(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('<title>é</title>')])), '<title>é</title>');
+  // A character cut in half where the read stopped doesn't make the page "not UTF-8".
+  const cut = Buffer.from('<meta charset="iso-8859-1"><title>café ✓</title>✓');
+  assert.match(decodeHead(cut.subarray(0, cut.length - 1)), /café ✓<\/title>$/);
+});
+
+test('decodeHead ignores charset mentions that are not a real declaration, for non-UTF-8 bytes too', () => {
+  const page = prefix => Buffer.concat([Buffer.from(prefix + '<meta charset="windows-1252"><title>'), CAFE_1252]);
+  assert.match(decodeHead(page('<!-- <meta charset="koi8-r"> -->')), /café!$/);
+  assert.match(decodeHead(page('<meta name="description" content="charset=koi8-r">')), /café!$/);
+  assert.match(decodeHead(page('<meta name="x" data-charset="koi8-r">')), /café!$/);
+});
+
+test('decodeHead handles UTF-16 marks, unknown charsets and empty input', () => {
   const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('<title>hi</title>', 'utf16le')]);
   assert.equal(decodeHead(utf16), '<title>hi</title>');
-  // A meta tag readable as ASCII that claims UTF-16 is treated as UTF-8.
-  assert.equal(decodeHead(Buffer.from('<meta charset="utf-16"><title>ok</title>')), '<meta charset="utf-16"><title>ok</title>');
+  // Not UTF-8, and the declared encoding is nonsense: lossy UTF-8, as before.
+  assert.equal(decodeHead(CAFE_1252, 'text/html; charset=klingon-1'), 'caf\ufffd!');
+  assert.equal(decodeHead(Buffer.concat([Buffer.from('<meta charset="utf-16"><title>'), CAFE_1252])), '<meta charset="utf-16"><title>caf\ufffd!');
+  assert.equal(decodeHead(CAFE_1252), 'caf\ufffd!');
   assert.equal(decodeHead(Buffer.alloc(0)), '');
+});
+
+test('decodeHead stays fast on a hostile head full of unclosed <meta tags', () => {
+  // Not UTF-8 (the 0xff), no charset anywhere: the worst case for the fallback.
+  const hostile = Buffer.concat([Buffer.from('<meta '.repeat(85000)), Buffer.from([0xff])]);
+  const startedAt = Date.now();
+  decodeHead(hostile, 'text/html');
+  assert.ok(Date.now() - startedAt < 1500, `took ${Date.now() - startedAt} ms`);
 });
 
 test('siteHandleUrl is only built from something shaped like a Twitter handle', () => {
@@ -125,7 +178,7 @@ test('siteHandleUrl is only built from something shaped like a Twitter handle', 
   const url = 'https://example.com/a';
   assert.equal(extractPreviewMetadata(page('@example_1'), url, url).siteHandleUrl, 'https://twitter.com/example_1');
   assert.equal(extractPreviewMetadata(page('example'), url, url).siteHandleUrl, 'https://twitter.com/example');
-  for (const bad of ['../../i/flow/login', 'a?b=c', 'two words', '@', 'waytoolongforatwitterhandle', 'é']) {
+  for (const bad of ['../../i/flow/login', 'a?b=c', 'two words', '@', '@@example', 'https://twitter.com/example', 'waytoolongforatwitterhandle', 'é']) {
     const preview = extractPreviewMetadata(page(bad), url, url);
     assert.equal(preview.siteHandleUrl, null, bad);
     assert.equal(preview.siteHandle, bad, 'the handle text itself is still returned');

@@ -49,7 +49,7 @@ cp .env.example .env
 
 Numeric settings must be whole numbers; anything else (`-1`, `1e3`, `300ms`) is ignored with a warning and the default is used.
 
-**CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` defaults to the Pincushion frontend at `https://rossshannon.github.io`:
+**CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` (which `npm run dev` reads once copied to `.env`) allows the Pincushion frontend at `https://rossshannon.github.io` and a local frontend on `http://localhost:3000`. In production, list only the real origins:
 
 ```bash
 ALLOWED_ORIGINS=https://rossshannon.github.io
@@ -153,7 +153,7 @@ This endpoint keeps preview scraping on the server (no extra browser permissions
 }
 ```
 
-`preview` is omitted (or `null`) when no metadata is found. If the metadata fetch fails entirely (timeout, unsupported MIME type, invalid URL, etc.), the endpoint still returns the Pinboard suggestions but adds a `previewError` string and sets `previewStatus` to `error`. When data is returned straight from a fresh fetch, `previewStatus` is `fresh` (future updates may re-use this flag to signal cached responses). Whenever the site exposes a Twitter creator/site tag, the payload also includes `siteHandleUrl` so UIs can link to the social profile directly.
+`preview` is omitted (or `null`) when no metadata is found. If the metadata fetch fails entirely (timeout, unsupported MIME type, invalid URL, etc.), the endpoint still returns the Pinboard suggestions but adds a `previewError` string and sets `previewStatus` to `error`. When data is returned straight from a fresh fetch, `previewStatus` is `fresh` (future updates may re-use this flag to signal cached responses). When the site's Twitter creator/site tag holds a plain handle (`@name`, up to 15 letters, digits or underscores), the payload also includes `siteHandleUrl` so UIs can link to the profile directly; for anything else `siteHandle` is returned and `siteHandleUrl` is `null`.
 
 **Limits & logging**
 
@@ -205,7 +205,7 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - 25-second budget for each Pinboard call, queueing included
 - Preview and network failures are reported by kind only; the detail stays in the logs. (A Pinboard error response on `/v1/*` is passed back with Pinboard's own status and text.)
 - Authorization headers only (tokens never logged in URLs)
-- `/v1/*` only forwards paths that stay under `/v1/` on `api.pinboard.in`
+- `/v1/*` only forwards plain paths under `/v1/` on `api.pinboard.in` (no dot segments or percent-escapes)
 - The preview fetcher refuses private, loopback and link-local addresses, at DNS time and on every redirect
 - `Cache-Control: no-store` on every response, no ETags, so account data never lands in a browser cache
 
@@ -213,9 +213,9 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 
 ### Version 2.3.1
 - Clear four dependency advisories (follow-redirects, undici, qs) and bump axios to 1.21.1 and fast-xml-parser to 5.12.0
-- Refuse `/v1/` paths that resolve outside `/v1/` (`/v1/../x`, `/v1/%2e%2e/x`) with a 400 instead of forwarding them to Pinboard
-- Forward bracketed query keys (`a[b]=c`) to Pinboard as sent, rather than as `a=[object Object]`
-- Decode preview pages with the encoding they declare (byte-order mark, `Content-Type`, or `<meta charset>`), so Shift_JIS, GBK and windows-1252 titles are no longer garbled
+- Only forward `/v1/` paths made of plain segments (letters, digits, `_`, `-`); anything else, such as `/v1/../x` or `/v1/%2e%2e/x`, gets a 400 instead of reaching Pinboard
+- Forward bracketed query keys (`a[b]=c`) to Pinboard as sent, rather than as `a=[object Object]`; `auth_token[]` and similar spellings are dropped like `auth_token` itself
+- Decode preview pages that aren't UTF-8 with the encoding they declare (`Content-Type`, or `<meta charset>`), so Shift_JIS, GBK and windows-1252 titles are no longer garbled
 - Only build `siteHandleUrl` from something that looks like a Twitter handle
 - Space Pinboard calls per user and token however the `Authorization` header spells them
 - On `/posts/suggest-with-preview`, report a network failure by kind rather than with the raw error text
