@@ -83,6 +83,12 @@ const server = http.createServer(app);
 // Trust proxy - required for rate limiting behind Heroku
 app.set('trust proxy', 1);
 
+// Parse query strings flatly. Express's default (qs) turns `a[b]=c` into a
+// nested object, which the proxy would forward to Pinboard as
+// "a=[object Object]"; the simple parser keeps the key as "a[b]", so what
+// reaches Pinboard is what the client sent.
+app.set('query parser', 'simple');
+
 // Every response here is either a private, authenticated view of a
 // Pinboard account or a health probe: nothing a browser should keep. Express
 // would otherwise attach a validator ETag to each JSON body, which invites
@@ -130,10 +136,8 @@ const corsOptions = {
   maxAge: CORS_PREFLIGHT_MAX_AGE_SECONDS,
 };
 
+// cors() also answers every CORS preflight (OPTIONS) itself.
 app.use(cors(corsOptions));
-
-// Respond immediately to CORS preflight checks
-app.options('*', cors(corsOptions));
 
 // Turn any error into a JSON response: CORS rejections become 403, client
 // errors Express flags itself (such as a malformed percent-encoded path) keep
@@ -219,9 +223,9 @@ const previewRequestConfig = {
 
 // Per-user spacing of Pinboard calls. Each user has a queue: a call starts
 // one interval after the previous call started (or would start), or at once
-// if nothing is ahead of it. Queues are keyed on the whole credential, not the
-// username alone, so a request carrying someone else's username and a wrong
-// token can't use up their slots.
+// if nothing is ahead of it. Queues are keyed on the whole credential
+// (username and token), not the username alone, so a request carrying someone
+// else's username and a wrong token can't use up their slots.
 const pinboardQueues = new Map();
 let lastQueueSweepAt = 0;
 
@@ -392,13 +396,29 @@ const decodeBasicCredentials = encoded => {
 // keep them to characters that can't forge a line or a field.
 const logSafeIdentity = value => String(value || '').replace(/[^\w.@+-]/g, '?').slice(0, 64) || 'unknown';
 
+// The path of a /v1/ call goes into log lines too.
+const logSafeLabel = value => String(value || '').replace(/[^\w./-]/g, '?').slice(0, 64) || 'unknown';
+
+// True when a request path still points under /v1/ on Pinboard's host after
+// the URL parser has resolved it the way the HTTP client will.
+const isPinboardV1Path = path => {
+  try {
+    const resolved = new URL(`${PINBOARD_BASE_URL}${path}`);
+    return resolved.origin === PINBOARD_BASE_URL && resolved.pathname.startsWith('/v1/');
+  } catch (err) {
+    return false;
+  }
+};
+
 const applyAuthContext = (req, queryParams) => {
   if (queryParams) {
     queryParams.delete('auth_token');
   }
 
   const authHeader = req.get('authorization') || '';
-  const slotKey = crypto.createHash('sha256').update(authHeader).digest('hex');
+  // Keyed on the decoded credential, so the same user and token share one
+  // queue however the header spells them (Basic or Bearer, any spacing).
+  const slotKeyFor = credential => crypto.createHash('sha256').update(credential).digest('hex');
   const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
   const basicMatch = authHeader.match(/^Basic\s+(.+)$/i);
 
@@ -413,7 +433,7 @@ const applyAuthContext = (req, queryParams) => {
         auth: { username, password }
       },
       identity: logSafeIdentity(username),
-      slotKey
+      slotKey: slotKeyFor(`${username}:${password}`)
     };
   }
 
@@ -428,7 +448,7 @@ const applyAuthContext = (req, queryParams) => {
     return {
       requestConfig: { ...apiRequestDefaults },
       identity: logSafeIdentity(authToken.split(':')[0] || 'token'),
-      slotKey
+      slotKey: slotKeyFor(authToken)
     };
   }
 
@@ -594,16 +614,6 @@ const pickMetaValue = ($, selector, attributePreference = ['content', 'value', '
   return text && text.trim() ? text.trim() : null;
 };
 
-const pickMetaValueWithSource = ($, selectors) => {
-  for (const selector of selectors) {
-    const value = pickMetaValue($, selector);
-    if (value) {
-      return { value, source: selector };
-    }
-  }
-  return { value: null, source: null };
-};
-
 const FAVICON_SELECTORS = [
   'link[rel="apple-touch-icon"]',
   'link[rel="apple-touch-icon-precomposed"]',
@@ -643,16 +653,15 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
   const siteName = pickMetaValue($, 'meta[property="og:site_name"]')
     || pickMetaValue($, 'meta[name="application-name"]');
 
-  const siteHandleCandidate = pickMetaValueWithSource($, [
-    'meta[name="twitter:site"]',
-    'meta[name="twitter:creator"]'
-  ]);
-  const siteHandle = siteHandleCandidate.value;
+  const siteHandle = pickMetaValue($, 'meta[name="twitter:site"]')
+    || pickMetaValue($, 'meta[name="twitter:creator"]');
 
+  // Only link a handle that looks like one: the page chooses this text, and
+  // anything else ("../x", "a?b") would point the link somewhere else.
   let siteHandleUrl = null;
-  if (siteHandle && siteHandleCandidate.source?.includes('twitter')) {
+  if (siteHandle) {
     const normalizedHandle = siteHandle.replace(/^@/, '').trim();
-    if (normalizedHandle) {
+    if (/^[A-Za-z0-9_]{1,15}$/.test(normalizedHandle)) {
       siteHandleUrl = `https://twitter.com/${normalizedHandle}`;
     }
   }
@@ -757,11 +766,40 @@ const createHeadEndScanner = () => {
   };
 };
 
+// Turn the bytes of a page's head into text using the encoding the page
+// declares: a byte-order mark first, then the Content-Type header, then a
+// <meta charset> (or http-equiv) tag, and UTF-8 if none of those says. Without
+// this a Shift_JIS or windows-1252 page comes out as mojibake.
+const META_CHARSET = /<meta\b[^>]*?\bcharset\s*=\s*["']?\s*([\w.:-]+)/i;
+const decodeHead = (buffer, contentType = '') => {
+  let charset = null;
+  if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) charset = 'utf-8';
+  else if (buffer[0] === 0xff && buffer[1] === 0xfe) charset = 'utf-16le';
+  else if (buffer[0] === 0xfe && buffer[1] === 0xff) charset = 'utf-16be';
+  if (!charset) {
+    charset = /charset\s*=\s*["']?\s*([\w.:-]+)/i.exec(contentType)?.[1] || null;
+  }
+  if (!charset) {
+    charset = META_CHARSET.exec(buffer.toString('latin1'))?.[1] || null;
+    // A tag we could read as ASCII can't really be UTF-16.
+    if (charset && /^utf-?16/i.test(charset)) charset = 'utf-8';
+  }
+  if (charset && !/^utf-?8$/i.test(charset)) {
+    try {
+      return new TextDecoder(charset).decode(buffer);
+    } catch (err) {
+      // An encoding this runtime doesn't know: fall through to UTF-8.
+    }
+  }
+  return new TextDecoder('utf-8').decode(buffer);
+};
+
 // Read a streamed response until </head> (or the byte cap) and drop the rest
-// of the page. Non-stream bodies (strings, buffers) are returned as they are.
-const readHead = async data => {
+// of the page. Strings are returned as they are; bytes are decoded with the
+// page's declared encoding.
+const readHead = async (data, contentType = '') => {
   if (typeof data === 'string') return data;
-  if (Buffer.isBuffer(data)) return data.toString('utf8');
+  if (Buffer.isBuffer(data)) return decodeHead(data, contentType);
   if (!data || typeof data.on !== 'function') return String(data || '');
 
   return new Promise((resolve, reject) => {
@@ -773,7 +811,7 @@ const readHead = async data => {
       if (settled) return;
       settled = true;
       data.destroy();
-      resolve(Buffer.concat(chunks).toString('utf8'));
+      resolve(decodeHead(Buffer.concat(chunks), contentType));
     };
     data.on('data', chunk => {
       chunks.push(chunk);
@@ -810,7 +848,7 @@ const fetchPreview = async targetUrl => {
       throw new Error('Preview response is not HTML');
     }
 
-    const body = await readHead(response.data);
+    const body = await readHead(response.data, contentType);
     return extractPreviewMetadata(body, finalUrl, targetUrl.toString());
   } catch (error) {
     // A 4xx/5xx rejects with the unread response attached; it needs tearing
@@ -1025,8 +1063,11 @@ app.get('/posts/suggest-with-preview', limiter, suggestWithPreviewRateLimiter, a
         suggestionsError = `Pinboard suggest returned ${upstreamStatus}`;
       } else if (UPSTREAM_TIMEOUT_CODES.has(error.code)) {
         suggestionsError = 'Pinboard suggest timed out';
+      } else if (UPSTREAM_UNREACHABLE_CODES.has(error.code)) {
+        suggestionsError = 'Pinboard API is unreachable';
       } else {
-        suggestionsError = error.message || 'Pinboard suggest failed';
+        // The raw message stays in the log line below.
+        suggestionsError = 'Pinboard suggest failed';
       }
       console.error('Pinboard suggest error:', error.message);
     } else {
@@ -1073,13 +1114,20 @@ app.get('/v1/*', async (req, res) => {
     const path = req.path; // This includes /v1/...
     let url = `${PINBOARD_BASE_URL}${path}`;
 
+    // Dot segments ("/v1/../x", also as %2e%2e) are resolved by the HTTP
+    // client, which would let a request climb out of /v1/ on Pinboard's
+    // host. Only forward paths that are still under /v1/ once resolved.
+    if (!isPinboardV1Path(path)) {
+      return res.status(400).json({ error: 'Invalid API path' });
+    }
+
     const queryString = queryParams.toString();
     if (queryString) {
       url += `?${queryString}`;
     }
 
     // Make request to Pinboard API
-    const response = await pinboardGet(url, authContext, path.replace(/^\/v1\//, ''), clientGoneSignal(res));
+    const response = await pinboardGet(url, authContext, logSafeLabel(path.replace(/^\/v1\//, '')), clientGoneSignal(res));
     const { data, status } = response;
 
     if (status !== 200) {
@@ -1176,4 +1224,4 @@ const queuedPinboardCalls = () => {
   return count;
 };
 
-module.exports = { app, server, parseIntSetting, jsonErrorHandler, pinboardSettings, queuedPinboardCalls, isPrivateAddress, isPrivateHostname, guardRedirect, fetchPreview, readHead, addressGuard };
+module.exports = { app, server, decodeHead, isPinboardV1Path, extractPreviewMetadata, parseIntSetting, jsonErrorHandler, pinboardSettings, queuedPinboardCalls, isPrivateAddress, isPrivateHostname, guardRedirect, fetchPreview, readHead, addressGuard };
