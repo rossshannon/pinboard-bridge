@@ -3,6 +3,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const crypto = require('crypto');
 const dns = require('dns');
 const helmet = require('helmet');
@@ -209,7 +210,16 @@ const apiRequestDefaults = {
   }
 };
 
+// Previews go to a different host almost every time, so there is nothing to
+// gain from keeping their connections open. Without this, a page that ends
+// before we hang up leaves its socket idling in Node's shared keep-alive
+// pool until the far end times it out.
+const previewHttpAgent = new http.Agent({ keepAlive: false });
+const previewHttpsAgent = new https.Agent({ keepAlive: false });
+
 const previewRequestConfig = {
+  httpAgent: previewHttpAgent,
+  httpsAgent: previewHttpsAgent,
   maxRedirects: 3,
   maxContentLength: PREVIEW_MAX_BYTES,
   maxBodyLength: PREVIEW_MAX_BYTES,

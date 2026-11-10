@@ -35,6 +35,7 @@ No API contract changed. Pincushion (master and PR #86) calls `/v1/tags/get`, `/
 | 10 | Inconsistent | `"private": "true"` was a string | Now the boolean `true` |
 | 10a | Inconsistent | With fix 8, the sample `.env` gives a dev server that only allows the GitHub Pages origin | `.env.example` keeps its production-safe values and gains a commented-out line adding `http://localhost:3000`; the README explains when to use it |
 | 10b | Broken test | `time spent queueing comes out of the Pinboard timeout` asserted exactly 25000 ms and failed about one run in fifteen with 24999 | Allows a few milliseconds |
+| 10c | Inefficient, and red CI | Preview fetches used Node's shared keep-alive pool, so a page that ended before the bridge hung up left an idle socket open to that site. Under Node 24.22 (CI and Heroku's line) this failed `preview-real-socket.test.js` on every run, on master as well; Node 22 here hid it | Previews use their own agents with `keepAlive: false`; a test asserts no connection lingers after a page that ends by itself |
 | 11 | Insecure (minor) | The CI workflow ran with the default token permissions | `permissions: contents: read` |
 | 12 | Inconsistent | The `/v1/` path went into a log line unfiltered | The path allow-list in fix 2 leaves only safe characters; the label is also cut to 64 characters |
 | 13 | Inconsistent docs | README said `git push heroku main` (the branch is `master`), a 30-second timeout (it is 25), “per-token preview throttling” (it is per IP), “no request logging” (it logs a line per Pinboard call and preview), and “without leaking upstream responses” (a Pinboard error body is passed back on `/v1/*`) | Corrected; changelog entry for 2.3.1 added |
@@ -150,3 +151,7 @@ The multi-LLM review skill is only on Ross's Mac, so per the project policy this
 10. This file's test count and lesson numbering were stale. Corrected.
 
 A third pass was not run. The policy asks for two; the remaining risk is concentrated in `decodeHead`, which now falls back to master's behaviour on every failure path.
+
+### Update - 2026-11-10 15:35 UTC: CI
+
+CI on the PR was red on all three commits with one failure, `ignores </head> and <body> inside scripts, styles, templates and comments`. It reproduces on `origin/master` under Node 24.22.2 (`npx -y node@24 --test`), so it predates this PR; master's last CI run was a month ago on an older Node 24. Cause: the preceding test's page ends normally, and its socket stayed in the global keep-alive pool, which the next test counted as a connection the bridge had failed to close. Fixed at the source (fix 10c) rather than in the test. **Lesson: the container's Node is 22; run the suite with `npx -y node@24 --test 'test/**/*.test.js'` before pushing, since CI and Heroku use 24.**

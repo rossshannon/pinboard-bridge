@@ -220,6 +220,7 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - Space Pinboard calls per user and token however the `Authorization` header spells them
 - On `/posts/suggest-with-preview`, report a network failure by kind rather than with the raw error text
 - `npm run dev` now reads `.env`, as the installation steps always implied
+- Close each preview connection when the fetch is done instead of leaving it in Node's keep-alive pool
 
 ### Version 2.3.0
 - Add `/preview`, which returns page metadata without waiting on Pinboard's `posts/suggest`
