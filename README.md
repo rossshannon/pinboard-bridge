@@ -49,7 +49,7 @@ cp .env.example .env
 
 Numeric settings must be whole numbers; anything else (`-1`, `1e3`, `300ms`) is ignored with a warning and the default is used.
 
-**CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` (which `npm run dev` reads once copied to `.env`) allows the Pincushion frontend at `https://rossshannon.github.io` and a local frontend on `http://localhost:3000`. In production, list only the real origins:
+**CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` defaults to the Pincushion frontend at `https://rossshannon.github.io`. `npm run dev` reads `.env`, so to call a local bridge from a frontend served on your own machine, switch to the commented-out line in that file that adds `http://localhost:3000`; otherwise the browser gets `403 Origin not allowed by CORS policy`.
 
 ```bash
 ALLOWED_ORIGINS=https://rossshannon.github.io
@@ -215,7 +215,7 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - Clear four dependency advisories (follow-redirects, undici, qs) and bump axios to 1.21.1 and fast-xml-parser to 5.12.0
 - Only forward `/v1/` paths made of plain segments (letters, digits, `_`, `-`); anything else, such as `/v1/../x` or `/v1/%2e%2e/x`, gets a 400 instead of reaching Pinboard
 - Forward bracketed query keys (`a[b]=c`) to Pinboard as sent, rather than as `a=[object Object]`; `auth_token[]` and similar spellings are dropped like `auth_token` itself
-- Decode preview pages that aren't UTF-8 with the encoding they declare (`Content-Type`, or `<meta charset>`), so Shift_JIS, GBK and windows-1252 titles are no longer garbled
+- When a preview page doesn't read cleanly as UTF-8, decode it with the encoding it declares (`Content-Type`, or a `<meta charset>` in its first 1024 bytes), so Shift_JIS, GBK and windows-1252 titles are no longer garbled. (Encodings whose bytes also pass as UTF-8, such as ISO-2022-JP, are still read as UTF-8.)
 - Only build `siteHandleUrl` from something that looks like a Twitter handle
 - Space Pinboard calls per user and token however the `Authorization` header spells them
 - On `/posts/suggest-with-preview`, report a network failure by kind rather than with the raw error text

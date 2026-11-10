@@ -406,7 +406,11 @@ const isPinboardV1Path = path => PINBOARD_V1_PATH.test(path);
 
 // True for a query key Pinboard might read as auth_token: the plain name, or
 // an array or PHP-style spelling of it ("auth_token[]", "auth.token").
-const isAuthTokenKey = key => /^auth[_. ]token(?:\[|$)/i.test(key.trim());
+// A server that parses query strings as PHP does also turns a space, "." or
+// unmatched "[" in a name into "_", ignores leading spaces, and cuts the name
+// at a NUL, so those are covered too. Stripping too much costs nothing:
+// Pinboard has no other parameter that starts this way.
+const isAuthTokenKey = key => /^auth[_. []token(?:\[|$)/i.test(key.split('\0')[0].trimStart());
 
 const applyAuthContext = (req, queryParams) => {
   if (queryParams) {
@@ -766,21 +770,40 @@ const createHeadEndScanner = () => {
   };
 };
 
-// Turn the bytes of a page's head into text. Most pages are UTF-8 whatever
-// they claim, so bytes that are valid UTF-8 are read as UTF-8. Only when they
-// are not does the declared encoding decide: the Content-Type header, then a
-// <meta charset> or http-equiv tag. Without this a Shift_JIS or windows-1252
-// page comes out as mojibake.
+// Turn the bytes of a page's head into text. Nearly every page is UTF-8, so
+// bytes that decode cleanly as UTF-8 are returned as UTF-8 and nothing else
+// is looked at. Only when that leaves broken characters is the page's
+// declared encoding tried: the Content-Type header, then a <meta charset> or
+// http-equiv tag. Without this a Shift_JIS or windows-1252 page comes out as
+// mojibake. Whatever goes wrong here, the answer is the plain UTF-8 reading.
+const CHARSET_LABEL = /charset\s*=\s*["']?\s*([\w.:-]+)/i;
+// Browsers look for the tag in the first 1024 bytes; so do we, which also
+// keeps this extra parse small whatever the page sends.
+const META_PRESCAN_BYTES = 1024;
+
+// The encoding a label names, in TextDecoder's canonical spelling, or null
+// if it names none we can use. UTF-8 is already tried first; a tag or header
+// we could read as ASCII can't truthfully say UTF-16.
+const legacyEncoding = label => {
+  if (!label) return null;
+  try {
+    const encoding = new TextDecoder(label).encoding;
+    return /^utf-(8|16)/.test(encoding) ? null : encoding;
+  } catch (err) {
+    return null;
+  }
+};
+
 const declaredMetaCharset = buffer => {
   // Parsed, not pattern-matched: comments and other attributes can mention a
   // charset too. latin1 keeps every byte, and the tags we want are ASCII.
-  const $ = cheerio.load(buffer.toString('latin1'));
+  const $ = cheerio.load(buffer.subarray(0, META_PRESCAN_BYTES).toString('latin1'));
   const direct = $('meta[charset]').first().attr('charset');
   if (direct && direct.trim()) return direct.trim();
   let found = null;
   $('meta[http-equiv]').each((index, element) => {
     if (found || String($(element).attr('http-equiv')).trim().toLowerCase() !== 'content-type') return;
-    found = /charset\s*=\s*["']?\s*([\w.:-]+)/i.exec($(element).attr('content') || '')?.[1] || null;
+    found = CHARSET_LABEL.exec($(element).attr('content') || '')?.[1] || null;
   });
   return found;
 };
@@ -788,22 +811,20 @@ const declaredMetaCharset = buffer => {
 const decodeHead = (buffer, contentType = '') => {
   if (buffer[0] === 0xff && buffer[1] === 0xfe) return new TextDecoder('utf-16le').decode(buffer);
   if (buffer[0] === 0xfe && buffer[1] === 0xff) return new TextDecoder('utf-16be').decode(buffer);
+  // `stream` keeps a character cut off at the very end from counting as broken.
+  const utf8 = new TextDecoder('utf-8').decode(buffer, { stream: true });
+  const broken = utf8.split('\ufffd').length - 1;
+  if (broken === 0) return utf8;
   try {
-    // `stream` lets a character cut off at the very end of the bytes pass.
-    return new TextDecoder('utf-8', { fatal: true }).decode(buffer, { stream: true });
+    // A UTF-8 page with the odd stray byte has far more good multi-byte
+    // characters than broken ones; text in another encoding has the reverse.
+    const intact = utf8.replace(/[\x00-\x7f\ufffd]/g, '').length;
+    if (intact > broken) return utf8;
+    const encoding = legacyEncoding(CHARSET_LABEL.exec(contentType)?.[1]) || legacyEncoding(declaredMetaCharset(buffer));
+    return encoding ? new TextDecoder(encoding).decode(buffer) : utf8;
   } catch (err) {
-    // Not UTF-8: see what the page says it is.
+    return utf8;
   }
-  const charset = /charset\s*=\s*["']?\s*([\w.:-]+)/i.exec(contentType)?.[1] || declaredMetaCharset(buffer);
-  // A tag we could read as ASCII can't really be UTF-16.
-  if (charset && !/^utf-?(8|16)/i.test(charset)) {
-    try {
-      return new TextDecoder(charset).decode(buffer);
-    } catch (err) {
-      // An encoding this runtime doesn't know: fall through to UTF-8.
-    }
-  }
-  return new TextDecoder('utf-8').decode(buffer);
 };
 
 // Read a streamed response until </head> (or the byte cap) and drop the rest
@@ -823,7 +844,12 @@ const readHead = async (data, contentType = '') => {
       if (settled) return;
       settled = true;
       data.destroy();
-      resolve(decodeHead(Buffer.concat(chunks), contentType));
+      // This runs inside a stream listener, where a throw would be uncaught.
+      try {
+        resolve(decodeHead(Buffer.concat(chunks), contentType));
+      } catch (err) {
+        reject(err);
+      }
     };
     data.on('data', chunk => {
       chunks.push(chunk);

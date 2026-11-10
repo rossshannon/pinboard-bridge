@@ -2,6 +2,7 @@
 const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const { Readable } = require('node:stream');
 const axios = require('axios');
 
 let upstream = null;
@@ -22,7 +23,7 @@ axios.defaults.adapter = async config => {
 
 process.env.PORT = '0';
 process.env.PINBOARD_MIN_INTERVAL_MS = '0';
-const { server, decodeHead, isPinboardV1Path, isAuthTokenKey, extractPreviewMetadata } = require('../web.js');
+const { server, readHead, decodeHead, isPinboardV1Path, isAuthTokenKey, extractPreviewMetadata } = require('../web.js');
 
 before(async () => {
   if (!server.listening) await new Promise(resolve => server.once('listening', resolve));
@@ -91,7 +92,7 @@ test('bracketed query keys reach Pinboard as they were sent', async () => {
 });
 
 test('an auth_token in the query is still dropped in favour of the header, however it is spelt', async () => {
-  await rawGet('/v1/posts/get?format=json&auth_token=someone:ELSE&auth_token[]=a:B&auth_token[x]=c:D&auth%5ftoken=e:F&auth.token=g:H&AUTH_TOKEN=i:J&tag=keep');
+  await rawGet('/v1/posts/get?format=json&auth_token=someone:ELSE&auth_token[]=a:B&auth_token[x]=c:D&auth%5ftoken=e:F&auth.token=g:H&AUTH_TOKEN=i:J&auth[token=k:L&auth_token%00x=m:N&%20auth_token=o:P&auth+token=q:R&tag=keep');
   const sent = new URL(captured[0]).searchParams;
   assert.deepEqual([...sent.keys()].sort(), ['auth_token', 'format', 'tag']);
   assert.deepEqual(sent.getAll('auth_token'), ['testuser:DEADBEEF']);
@@ -165,12 +166,49 @@ test('decodeHead handles UTF-16 marks, unknown charsets and empty input', () => 
   assert.equal(decodeHead(Buffer.alloc(0)), '');
 });
 
-test('decodeHead stays fast on a hostile head full of unclosed <meta tags', () => {
-  // Not UTF-8 (the 0xff), no charset anywhere: the worst case for the fallback.
-  const hostile = Buffer.concat([Buffer.from('<meta '.repeat(85000)), Buffer.from([0xff])]);
-  const startedAt = Date.now();
-  decodeHead(hostile, 'text/html');
-  assert.ok(Date.now() - startedAt < 1500, `took ${Date.now() - startedAt} ms`);
+test('one stray byte does not hand a UTF-8 page to a wrong declared charset', () => {
+  const page = Buffer.concat([Buffer.from('<meta charset="iso-8859-1"><title>café ✓ naïve</title></head><body>'), Buffer.from([0xe9, 0x21])]);
+  assert.match(decodeHead(page, 'text/html; charset=ISO-8859-1'), /<title>café ✓ naïve<\/title>/);
+});
+
+test('labels that really mean UTF-16 or UTF-8 are not applied to bytes we could read as ASCII', () => {
+  for (const label of ['ucs-2', 'unicode', 'csunicode', 'unicodefffe', 'iso-10646-ucs-2', 'utf-16le', 'UTF8', 'unicode-1-1-utf-8']) {
+    const page = Buffer.concat([Buffer.from(`<meta charset="${label}"><title>`), CAFE_1252]);
+    assert.equal(decodeHead(page), `<meta charset="${label}"><title>caf\ufffd!`, label);
+    assert.match(decodeHead(page, `text/html; charset=${label}`), /<title>caf\ufffd!$/, label);
+  }
+});
+
+test('a Content-Type charset we cannot use does not stop the <meta> tag being read', () => {
+  const page = Buffer.concat([Buffer.from('<meta charset="windows-1252"><title>'), CAFE_1252]);
+  for (const label of ['utf8mb4', 'none', 'binary']) {
+    assert.match(decodeHead(page, `text/html; charset=${label}`), /<title>café!$/, label);
+  }
+});
+
+test('a <meta charset> after the first 1024 bytes is not looked for', () => {
+  const page = Buffer.concat([Buffer.from('<!--' + 'x'.repeat(1100) + '--><meta charset="windows-1252"><title>'), CAFE_1252]);
+  assert.match(decodeHead(page), /<title>caf\ufffd!$/);
+});
+
+test('decodeHead stays fast, and does not throw, on hostile heads', async () => {
+  // Each is 64 KB or more, has a non-UTF-8 byte and declares no charset: the
+  // worst case, where every fallback is tried.
+  const attributes = Array.from({ length: 70000 }, (unused, index) => `a${index}`).join(' ');
+  const hostile = {
+    'unclosed <meta tags': '<meta '.repeat(85000),
+    'one <meta> with 70,000 attributes': `<meta ${attributes}`,
+    'deeply nested templates': '<template>'.repeat(7000),
+    'deeply nested divs': '<div>'.repeat(13000)
+  };
+  for (const [name, html] of Object.entries(hostile)) {
+    const bytes = Buffer.concat([Buffer.from(html), Buffer.from([0xff])]);
+    const startedAt = Date.now();
+    assert.equal(typeof decodeHead(bytes, 'text/html'), 'string', name);
+    assert.ok(Date.now() - startedAt < 1000, `${name} took ${Date.now() - startedAt} ms`);
+    // The same through the stream reader, where a throw would be uncaught.
+    assert.equal(typeof await readHead(Readable.from([bytes]), 'text/html'), 'string', name);
+  }
 });
 
 test('siteHandleUrl is only built from something shaped like a Twitter handle', () => {

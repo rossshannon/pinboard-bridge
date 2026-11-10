@@ -226,7 +226,8 @@ test('time spent queueing comes out of the Pinboard timeout', async () => {
     axios.defaults.adapter = originalAdapter;
   }
   timeouts.sort((a, b) => b - a);
-  assert.equal(timeouts[0], 25000);
+  // The unqueued call can lose a millisecond or two between being queued and sent.
+  assert.ok(timeouts[0] <= 25000 && timeouts[0] >= 24980, `expected ~25000ms, got ${timeouts[0]}`);
   assert.ok(timeouts[1] <= 24720 && timeouts[1] >= 24600, `expected ~24700ms, got ${timeouts[1]}`);
 });
 
