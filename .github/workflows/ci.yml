@@ -5,6 +5,10 @@ on:
     branches: ['**']
   pull_request:
 
+# The job only reads the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest

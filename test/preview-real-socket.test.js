@@ -172,6 +172,8 @@ test('does not mistake </header> for the end of the head', async () => {
   };
   const preview = await fetchPreview(new URL(`${base}/header-in-head`));
   assert.equal(preview.description, 'After the script');
+  // The page ended by itself; its connection must not linger in a keep-alive pool.
+  assert.ok(await allClosed(), 'expected no idle connection to be kept');
 });
 
 test('ignores </head> and <body> inside scripts, styles, templates and comments', async () => {

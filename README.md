@@ -14,7 +14,7 @@ A CORS-enabled proxy service for the Pinboard API with enhanced security feature
 - **Health Check Endpoint**: Monitor service status at `/health`
 - **Graceful Shutdown**: Proper handling of SIGTERM/SIGINT signals
 - **Error Handling**: Comprehensive error handling with consistent JSON responses
-- **Preview API**: Server-side endpoint that scrapes Twitter/Open Graph metadata alongside Pinboard suggestions
+- **Preview API**: Server-side endpoints that read a page's Twitter Card/Open Graph metadata, on its own (`/preview`) or alongside Pinboard suggestions
 
 ## Requirements
 
@@ -49,7 +49,7 @@ cp .env.example .env
 
 Numeric settings must be whole numbers; anything else (`-1`, `1e3`, `300ms`) is ignored with a warning and the default is used.
 
-**CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` defaults to the Pincushion frontend at `https://rossshannon.github.io`:
+**CORS strategy:** The bridge still allows every origin if `ALLOWED_ORIGINS` is unset (for backwards compatibility with self-hosted setups). For any public deployment you should list the exact origins that are allowed to call the proxy. The sample `.env.example` defaults to the Pincushion frontend at `https://rossshannon.github.io`. `npm run dev` reads `.env`, so to call a local bridge from a frontend served on your own machine, switch to the commented-out line in that file that adds `http://localhost:3000`; otherwise the browser gets `403 Origin not allowed by CORS policy`.
 
 ```bash
 ALLOWED_ORIGINS=https://rossshannon.github.io
@@ -80,8 +80,8 @@ ALLOWED_ORIGINS=https://rossshannon.github.io
 ## Running Locally
 
 ```bash
-npm run dev
-# or specify env vars
+npm run dev   # reads .env if there is one
+# or specify env vars (npm start does not read .env)
 PORT=1337 ALLOWED_ORIGINS=https://rossshannon.github.io npm start
 ```
 
@@ -153,7 +153,7 @@ This endpoint keeps preview scraping on the server (no extra browser permissions
 }
 ```
 
-`preview` is omitted (or `null`) when no metadata is found. If the metadata fetch fails entirely (timeout, unsupported MIME type, invalid URL, etc.), the endpoint still returns the Pinboard suggestions but adds a `previewError` string and sets `previewStatus` to `error`. When data is returned straight from a fresh fetch, `previewStatus` is `fresh` (future updates may re-use this flag to signal cached responses). Whenever the site exposes a Twitter creator/site tag, the payload also includes `siteHandleUrl` so UIs can link to the social profile directly.
+`preview` is omitted (or `null`) when no metadata is found. If the metadata fetch fails entirely (timeout, unsupported MIME type, invalid URL, etc.), the endpoint still returns the Pinboard suggestions but adds a `previewError` string and sets `previewStatus` to `error`. When data is returned straight from a fresh fetch, `previewStatus` is `fresh` (future updates may re-use this flag to signal cached responses). When the site's Twitter creator/site tag holds a plain handle (`@name`, up to 15 letters, digits or underscores), the payload also includes `siteHandleUrl` so UIs can link to the profile directly; for anything else `siteHandle` is returned and `siteHandleUrl` is `null`.
 
 **Limits & logging**
 
@@ -168,13 +168,13 @@ This endpoint keeps preview scraping on the server (no extra browser permissions
 
 1. Provision an app on the `heroku-26` stack (`heroku create --stack heroku-26`, or `heroku stack:set heroku-26` on an existing app followed by a fresh deploy).
 2. Set config vars (at minimum `NODE_ENV=production` and your chosen `ALLOWED_ORIGINS`).
-3. Push the main branch:
+3. Push the `master` branch:
 
    ```bash
-   git push heroku main
+   git push heroku master
    ```
 
-4. Tail logs with `heroku logs --tail` if you need to debug startup issues. (This service intentionally avoids application-level request logging to keep credentials out of Heroku Logplex.)
+4. Tail logs with `heroku logs --tail` if you need to debug startup issues. (The bridge never logs request URLs, headers or tokens. It does log one line per Pinboard call and per preview, with the username, the endpoint or the previewed page's hostname, and timings; see “Limits & logging” above.)
 
 ### Other hosting providers
 
@@ -193,7 +193,7 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 | `401 Authorization header required` | Missing/typoed `Authorization` header | Ensure the client always sends either Basic or Bearer credentials. |
 | `401 Invalid Bearer authorization header` | Bearer token missing `username:` prefix | Format should be `username:token`, exactly as Pinboard displays under “API token”. |
 | `403 Origin not allowed by CORS policy` | The requesting site is absent from `ALLOWED_ORIGINS` | Add the origin (scheme + host, optional port) to the env var or leave it blank for development. |
-| `504 Gateway timeout` | Pinboard took longer than 30 seconds to respond | Retry later; Pinboard occasionally rate limits. Consider adding caching upstream. |
+| `504 Gateway timeout` | Pinboard took longer than the 25-second budget (`PINBOARD_TOTAL_BUDGET_MS`), queueing included | Retry later; Pinboard occasionally rate limits. Consider adding caching upstream. |
 | `Too many requests` | Rate limiter tripped | Reduce polling frequency or implement client-side caching/backoff. |
 
 ## Security Features
@@ -201,13 +201,26 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - Helmet.js security headers
 - CORS origin validation with explicit 403 JSON responses for disallowed origins
 - Rate limiting per IP (300 per 15 minutes on `/v1/*`)
-- Per-token preview throttling and structured preview logging
+- Per-IP preview throttling and structured preview logging
 - 25-second budget for each Pinboard call, queueing included
-- Sanitized error messages without leaking upstream responses
+- Preview and network failures are reported by kind only; the detail stays in the logs. (A Pinboard error response on `/v1/*` is passed back with Pinboard's own status and text.)
 - Authorization headers only (tokens never logged in URLs)
+- `/v1/*` only forwards plain paths under `/v1/` on `api.pinboard.in` (no dot segments or percent-escapes)
+- The preview fetcher refuses private, loopback and link-local addresses, at DNS time and on every redirect
 - `Cache-Control: no-store` on every response, no ETags, so account data never lands in a browser cache
 
 ## Changelog
+
+### Version 2.3.1
+- Clear four dependency advisories (follow-redirects, undici, qs) and bump axios to 1.21.1 and fast-xml-parser to 5.12.0
+- Only forward `/v1/` paths made of plain segments (letters, digits, `_`, `-`); anything else, such as `/v1/../x` or `/v1/%2e%2e/x`, gets a 400 instead of reaching Pinboard
+- Forward bracketed query keys (`a[b]=c`) to Pinboard as sent, rather than as `a=[object Object]`; `auth_token[]` and similar spellings are dropped like `auth_token` itself
+- When a preview page doesn't read cleanly as UTF-8, decode it with the encoding it declares (`Content-Type`, or a `<meta charset>` in its first 1024 bytes), so Shift_JIS, GBK and windows-1252 titles are no longer garbled. (Encodings whose bytes also pass as UTF-8, such as ISO-2022-JP, are still read as UTF-8.)
+- Only build `siteHandleUrl` from something that looks like a Twitter handle
+- Space Pinboard calls per user and token however the `Authorization` header spells them
+- On `/posts/suggest-with-preview`, report a network failure by kind rather than with the raw error text
+- `npm run dev` now reads `.env`, as the installation steps always implied
+- Close each preview connection when the fetch is done instead of leaving it in Node's keep-alive pool
 
 ### Version 2.3.0
 - Add `/preview`, which returns page metadata without waiting on Pinboard's `posts/suggest`
