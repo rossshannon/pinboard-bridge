@@ -39,7 +39,7 @@ process.env.PORT = '0';
 process.env.PINBOARD_MIN_INTERVAL_MS = '300';
 process.env.PINBOARD_MAX_QUEUE_MS = '500';
 
-const { server } = require('../web.js');
+const { server, queuedPinboardCalls } = require('../web.js');
 
 before(async () => {
   if (!server.listening) {
@@ -210,24 +210,39 @@ test('spacing is keyed on the whole credential, so a wrong token cannot use up a
   assert.ok(gap < 200, `expected no spacing between different credentials, got a ${gap}ms gap`);
 });
 
-test('time spent queueing comes out of the Pinboard timeout', async () => {
+test('time spent queueing comes out of the Pinboard timeout', async t => {
   const timeouts = [];
   const originalAdapter = axios.defaults.adapter;
   axios.defaults.adapter = async config => {
     if (config.url.startsWith('https://api.pinboard.in/')) timeouts.push(config.timeout);
     return originalAdapter(config);
   };
+  // The bridge works out each wait from the clock, so the clock is held still
+  // here and moved by hand: on a busy machine a real one can tick between two
+  // readings a few lines apart, and the first call's "no wait" comes out as
+  // a millisecond or more.
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
   try {
-    await Promise.all([
+    const both = Promise.all([
       call('/v1/posts/get?format=json&url=1'),
       call('/v1/posts/get?format=json&url=2')
     ]);
+    // One call has gone to Pinboard and the other is waiting for its slot.
+    while (timeouts.length < 1 || queuedPinboardCalls() < 1) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.deepEqual(timeouts, [25000]);
+    // Its slot comes round one interval (300 ms here) after the first call.
+    t.mock.timers.tick(299);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(queuedPinboardCalls(), 1);
+    t.mock.timers.tick(1);
+    await both;
   } finally {
+    t.mock.timers.reset();
     axios.defaults.adapter = originalAdapter;
   }
-  timeouts.sort((a, b) => b - a);
-  assert.equal(timeouts[0], 25000);
-  assert.ok(timeouts[1] <= 24720 && timeouts[1] >= 24600, `expected ~24700ms, got ${timeouts[1]}`);
+  assert.deepEqual(timeouts, [25000, 24700]);
 });
 
 test('a username cannot forge extra log lines or fields', async () => {
