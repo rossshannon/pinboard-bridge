@@ -57,7 +57,21 @@ after(() => {
   bridge.close();
 });
 
-beforeEach(() => {
+// Wait until nothing a test set going is still running: every fetch, decode
+// and job place it started has ended.
+const settled = async () => {
+  const idle = () => thumbnailing.inFlight.size === 0 && thumbnailing.fetchesInFlight.size === 0
+    && thumbnailing.jobs.active === 0 && thumbnailing.decodeGate.active === 0;
+  for (let i = 0; i < 1000 && !idle(); i += 1) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(idle(), 'thumbnail work was still running');
+  assert.equal(thumbnailing.jobs.perClient.size, 0);
+  assert.equal(thumbnailing.decodeGate.held.size, 0);
+  assert.equal(thumbnailing.decodeGate.queues.size, 0);
+};
+
+beforeEach(async () => {
+  // No work outlives the test that started it.
+  await settled();
   routes = {};
   hits = [];
   thumbnailing.cache.clear();
@@ -339,11 +353,10 @@ test('small images are not enlarged', async () => {
   assert.deepEqual([body.thumbnails.favicon.width, body.thumbnails.favicon.height], [16, 16]);
 });
 
-test('tall images fit inside 240x240, and WebP, GIF and AVIF sources are accepted', async () => {
+test('tall images fit inside 240x240, and WebP and GIF sources are accepted', async () => {
   const sources = {
     '/tall.webp': await solid(300, 900).webp().toBuffer(),
     '/tall.gif': await solid(300, 900).gif().toBuffer(),
-    '/tall.avif': await solid(300, 900).avif().toBuffer(),
     '/tall.png': await solid(300, 900).png().toBuffer()
   };
   for (const [path, bytes] of Object.entries(sources)) {
@@ -354,6 +367,22 @@ test('tall images fit inside 240x240, and WebP, GIF and AVIF sources are accepte
     const { body } = await preview(`${base}/tall`);
     assert.deepEqual([body.thumbnails.image?.width, body.thumbnails.image?.height], [80, 240], path);
   }
+});
+
+test('AVIF and HEIF are not decoded: a tiny file can demand hundreds of megabytes', async () => {
+  const avif = await solid(64, 64).avif().toBuffer();
+  assert.equal(avif.toString('latin1', 4, 12), 'ftypavif');
+  // Refused by the first bytes, and the loader behind them is switched off too.
+  assert.equal(thumbnailing.sniffImageFormat(avif), null);
+  thumbnailing.engine.get();
+  await assert.rejects(sharp(avif).metadata(), /unsupported image format/);
+
+  routes['/photo.avif'] = serve(avif, 'image/avif');
+  routes['/page'] = page('<title>Page</title>', '<meta property="og:image" content="/photo.avif">', '<link rel="icon" href="/photo.avif">');
+  const { body, log } = await preview(`${base}/page`);
+  assert.deepEqual(body.thumbnails, { image: null, favicon: null });
+  assert.equal(body.thumbnailsStatus, 'complete');
+  assert.match(log, /image=unsupported/);
 });
 
 test('an animated image yields a single still frame, and metadata is stripped', async () => {
@@ -381,27 +410,108 @@ test('an animated image yields a single still frame, and metadata is stripped', 
 
 // ---- The page fetch decides whether anything else is fetched ----
 
-test('a page that cannot be fetched gets null thumbnails and no icon request', async () => {
+test('a page that fails for good gets null thumbnails, "complete", and no further requests', async () => {
   const missing = await preview(`${base}/missing`);
   assert.deepEqual(missing.body, {
     preview: null,
     previewStatus: 'error',
     previewError: 'Page returned HTTP 404',
     thumbnails: { image: null, favicon: null },
-    thumbnailsStatus: 'transient'
+    thumbnailsStatus: 'complete'
   });
   assert.deepEqual(hits, ['thumbs.test /missing']);
-  assert.match(missing.log, /outcome=preview_failed .*thumbs=transient image=no_page imageMs=0 favicon=no_page faviconMs=0$/);
+  assert.match(missing.log, /outcome=preview_failed .*thumbs=complete image=no_page imageMs=0 favicon=no_page faviconMs=0$/);
 
-  const blocked = await preview(`http://private.test:${port}/`);
-  assert.equal(blocked.body.previewError, 'URL host is not reachable from the proxy');
-  assert.deepEqual(blocked.body.thumbnails, { image: null, favicon: null });
-
-  routes['/file.pdf'] = serve(Buffer.from('%PDF-1.7'), 'application/pdf');
-  const notHtml = await preview(`${base}/file.pdf`);
-  assert.equal(notHtml.body.previewError, 'Preview response is not HTML');
-  assert.deepEqual(notHtml.body.thumbnails, { image: null, favicon: null });
+  for (const status of [400, 401, 403, 410, 451]) {
+    routes['/refused'] = (req, res) => res.writeHead(status, { 'content-type': 'text/html' }).end('<title>No</title>');
+    const refused = await preview(`${base}/refused`);
+    assert.equal(refused.body.previewError, `Page returned HTTP ${status}`);
+    assert.equal(refused.body.thumbnailsStatus, 'complete', status);
+  }
   assert.equal(hitCount('/favicon.ico'), 0);
+});
+
+test('a page on a private host, by name or by redirect, is "complete" and nothing else is fetched', async () => {
+  routes['/favicon.ico'] = serve(await solid(32, 32).png().toBuffer());
+  const byName = await preview(`http://private.test:${port}/`);
+  assert.equal(byName.body.previewError, 'URL host is not reachable from the proxy');
+  assert.deepEqual(byName.body.thumbnails, { image: null, favicon: null });
+  assert.equal(byName.body.thumbnailsStatus, 'complete');
+
+  routes['/bounce'] = (req, res) => res.writeHead(302, { location: `http://localhost:${port}/secret` }).end();
+  const byRedirect = await preview(`${base}/bounce`);
+  assert.equal(byRedirect.body.previewError, 'URL host is not reachable from the proxy');
+  assert.equal(byRedirect.body.thumbnailsStatus, 'complete');
+  assert.match(byRedirect.log, /image=no_page imageMs=0 favicon=no_page/);
+  // Not even the public origin that did the redirecting is asked for an icon.
+  assert.deepEqual(hits, ['thumbs.test /bounce']);
+});
+
+test('a page that fails in passing is "transient"', async () => {
+  for (const status of [500, 502, 503, 429, 408]) {
+    routes['/later'] = (req, res) => res.writeHead(status, { 'content-type': 'text/html' }).end('<title>Later</title>');
+    const later = await preview(`${base}/later`);
+    assert.equal(later.body.previewError, `Page returned HTTP ${status}`);
+    assert.deepEqual(later.body.thumbnails, { image: null, favicon: null });
+    assert.equal(later.body.thumbnailsStatus, 'transient', status);
+  }
+  routes['/dropped'] = (req, res) => res.destroy();
+  const dropped = await preview(`${base}/dropped`);
+  assert.equal(dropped.body.previewError, 'Could not fetch the page');
+  assert.equal(dropped.body.thumbnailsStatus, 'transient');
+
+  routes['/stall'] = (req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.write('<html><head><title>Slow'); };
+  const stalled = await preview(`${base}/stall`);
+  assert.equal(stalled.body.previewError, 'Preview fetch timed out');
+  assert.equal(stalled.body.thumbnailsStatus, 'transient');
+  assert.match(stalled.log, /thumbs=transient image=no_page/);
+  assert.equal(hitCount('/favicon.ico'), 0);
+});
+
+test('a link that is not a page (a PDF, an image) still gets its site\'s icon', async () => {
+  routes['/favicon.ico'] = serve(icoFile([{ size: 32, data: icoBitmap(32, 32, [0, 0, 255, 255]) }]), 'image/x-icon');
+  routes['/paper.pdf'] = serve(Buffer.from('%PDF-1.7'), 'application/pdf');
+  routes['/photo.png'] = serve(await solid(800, 600).png().toBuffer());
+
+  for (const path of ['/paper.pdf', '/photo.png']) {
+    thumbnailing.cache.clear();
+    hits = [];
+    const { body, log } = await preview(`${base}${path}`);
+    assert.equal(body.preview, null, path);
+    assert.equal(body.previewStatus, 'error', path);
+    assert.equal(body.previewError, 'Preview response is not HTML', path);
+    assert.equal(body.thumbnails.image, null, path);
+    assert.deepEqual([body.thumbnails.favicon.width, body.thumbnails.favicon.height], [32, 32], path);
+    assert.equal(body.thumbnailsStatus, 'complete', path);
+    assert.deepEqual(hits, [`thumbs.test ${path}`, 'thumbs.test /favicon.ico'], path);
+    assert.match(log, /outcome=preview_failed .*thumbs=complete image=none imageMs=\d+ favicon=ok faviconSource=fallback/, path);
+  }
+
+  // The icon comes from wherever the link finally led.
+  thumbnailing.cache.clear();
+  hits = [];
+  routes['/moved.pdf'] = (req, res) => res.writeHead(302, { location: `http://elsewhere.test:${port}/paper.pdf` }).end();
+  const moved = await preview(`${base}/moved.pdf`);
+  assert.ok(moved.body.thumbnails.favicon);
+  assert.deepEqual(hits, ['thumbs.test /moved.pdf', 'elsewhere.test /paper.pdf', 'elsewhere.test /favicon.ico']);
+
+  // No icon there is a settled answer too; a non-HTML error page is just a failed page.
+  thumbnailing.cache.clear();
+  routes['/favicon.ico'] = undefined;
+  const bare = await preview(`${base}/paper.pdf`);
+  assert.deepEqual(bare.body.thumbnails, { image: null, favicon: null });
+  assert.equal(bare.body.thumbnailsStatus, 'complete');
+  hits = [];
+  routes['/gone.pdf'] = (req, res) => res.writeHead(404, { 'content-type': 'application/pdf' }).end();
+  const gone = await preview(`${base}/gone.pdf`);
+  assert.equal(gone.body.thumbnailsStatus, 'complete');
+  assert.deepEqual(hits, ['thumbs.test /gone.pdf']);
+
+  // Without thumbnails=1 a non-HTML link answers as it always did, and fetches nothing more.
+  hits = [];
+  const plain = await preview(`${base}/paper.pdf`, '');
+  assert.deepEqual(plain.body, { preview: null, previewStatus: 'error', previewError: 'Preview response is not HTML' });
+  assert.deepEqual(hits, ['thumbs.test /paper.pdf']);
 });
 
 test('the target URL and Authorization header are checked as before', async () => {
@@ -596,9 +706,8 @@ test('a slow-drip image is dropped at the deadline; the icon still arrives', asy
   assert.match(log, /image=timeout imageMs=4\d\d\d favicon=ok/);
   assert.ok(elapsed >= thumbnailing.settings.phaseTimeoutMs - 100 && elapsed < thumbnailing.settings.phaseTimeoutMs + 1500, `took ${elapsed}ms`);
   assert.ok(await allClosed(), 'expected the bridge to close the connection');
-  assert.equal(thumbnailing.jobs.active, 0);
-
   assert.equal(body.thumbnailsStatus, 'transient');
+  await settled();
 
   // A timeout is only remembered for a short while.
   const entry = thumbnailing.cache.entries.get(`image ${base}/drip.png`);
@@ -659,13 +768,11 @@ test('the first bytes decide the format, and SVG is never one of them', async ()
   assert.equal(sniffImageFormat(Buffer.alloc(0)), null);
   assert.equal(sniffImageFormat(Buffer.from([0xff, 0xd8])), null);
   assert.equal(sniffImageFormat(Buffer.from('RIFF\0\0\0\0WAVE')), null);
-  // HEIC and other ISO media are not AVIF.
+  // No ISO media file is an image here: not AVIF, not HEIC, not MP4.
   assert.equal(sniffImageFormat(Buffer.from('\0\0\0\x18ftypheic\0\0\0\0mif1heic')), null);
   assert.equal(sniffImageFormat(Buffer.from('\0\0\0\x18ftypmp42\0\0\0\0isommp42')), null);
-  assert.equal(sniffImageFormat(Buffer.from('\0\0\0\x1cftypmif1\0\0\0\0mif1avifmiaf')), 'avif');
-  assert.equal(sniffImageFormat(Buffer.from('\0\0\0\x10ftypavif')), 'avif');
-  // A truncated box header must not read out of range.
-  assert.equal(sniffImageFormat(Buffer.from('\xff\xff\xff\xffftyp', 'latin1')), null);
+  assert.equal(sniffImageFormat(Buffer.from('\0\0\0\x1cftypmif1\0\0\0\0mif1avifmiaf')), null);
+  assert.equal(sniffImageFormat(Buffer.from('\0\0\0\x10ftypavif')), null);
   assert.equal(sniffImageFormat(Buffer.from([0, 0, 1, 0])), 'ico');
   assert.equal(sniffImageFormat(Buffer.from([0, 0, 2, 0])), null); // a cursor file
 });
@@ -681,30 +788,61 @@ test('an .ico file is only accepted as an icon, never as the preview image', asy
   assert.equal(hitCount('/image.ico'), 1);
 });
 
-test('images with decompression-bomb dimensions are refused', async () => {
+test('images with decompression-bomb dimensions are refused from their header', async () => {
   // Tiny files, enormous canvases: past the pixel limits for each kind.
-  const hugeImage = await sharp({ create: { width: 5000, height: 5000, channels: 3, background: '#123' } }).png().toBuffer();
-  const hugeIcon = await sharp({ create: { width: 2100, height: 2100, channels: 3, background: '#123' } }).png().toBuffer();
-  assert.ok(hugeImage.length < thumbnailing.settings.kinds.image.maxBytes);
-  assert.ok(5000 * 5000 > thumbnailing.settings.kinds.image.maxPixels);
-  assert.ok(2100 * 2100 > thumbnailing.settings.kinds.favicon.maxPixels);
+  const { image, favicon } = thumbnailing.settings.kinds;
+  const hugeImage = await sharp({ create: { width: 3200, height: 3200, channels: 3, background: '#123' } }).png().toBuffer();
+  const hugeIcon = await sharp({ create: { width: 1500, height: 1500, channels: 3, background: '#123' } }).png().toBuffer();
+  assert.ok(hugeImage.length < image.maxBytes);
+  assert.ok(3200 * 3200 > image.maxPixels);
+  assert.ok(1500 * 1500 > favicon.maxPixels && 1500 * 1500 < image.maxPixels);
   routes['/huge.png'] = serve(hugeImage);
   routes['/huge-icon.png'] = serve(hugeIcon);
   // The same icon wrapped in an .ico must not get round the limit.
   routes['/favicon.ico'] = serve(icoFile([{ size: 256, data: hugeIcon }]), 'image/x-icon');
   routes['/page'] = page('<title>Page</title>', '<meta property="og:image" content="/huge.png">', '<link rel="icon" href="/huge-icon.png">');
 
-  const startedAt = Date.now();
-  const { body, log } = await preview(`${base}/page`);
-  assert.deepEqual(body.thumbnails, { image: null, favicon: null });
-  assert.match(log, /image=undecodable imageMs=\d+ favicon=undecodable/);
-  assert.ok(Date.now() - startedAt < 2000, 'refused from the header, without decoding');
+  let decodes = 0;
+  const restore = withSharp(pipeline => {
+    const realToBuffer = pipeline.toBuffer.bind(pipeline);
+    pipeline.toBuffer = (...args) => { decodes += 1; return realToBuffer(...args); };
+    return pipeline;
+  });
+  try {
+    const { body, log } = await preview(`${base}/page`);
+    assert.deepEqual(body.thumbnails, { image: null, favicon: null });
+    assert.equal(body.thumbnailsStatus, 'complete');
+    assert.match(log, /image=too_large imageMs=\d+ favicon=too_large/);
+    assert.equal(decodes, 0, 'refused from the header, without decoding a pixel');
+  } finally {
+    restore();
+  }
 
   // The icon-sized limit applies to icons only: this one is fine as an image.
   routes['/page'] = page('<title>Page</title>', '<meta property="og:image" content="/huge-icon.png">');
   thumbnailing.cache.clear();
   const ok = await preview(`${base}/page`);
   assert.deepEqual([ok.body.thumbnails.image.width, ok.body.thumbnails.image.height], [240, 240]);
+});
+
+test('the limit is on decoded size, so a 16-bit image is allowed half the area', async () => {
+  const { image } = thumbnailing.settings.kinds;
+  const side = 2500;
+  assert.ok(side * side < image.maxPixels);
+  assert.ok(side * side * 4 <= image.maxDecodedBytes && side * side * 4 * 2 > image.maxDecodedBytes);
+  const deep = () => sharp({ create: { width: side, height: side, channels: 4, background: { r: 1, g: 2, b: 3, alpha: 0.5 } } });
+  routes['/eight.png'] = serve(await deep().png().toBuffer());
+  routes['/sixteen.png'] = serve(await deep().toColourspace('rgb16').png().toBuffer());
+  assert.equal((await sharp(await deep().toColourspace('rgb16').png().toBuffer()).metadata()).depth, 'ushort');
+
+  routes['/page'] = page('<title>Page</title>', '<meta property="og:image" content="/eight.png">');
+  const eight = await preview(`${base}/page`);
+  assert.deepEqual([eight.body.thumbnails.image.width, eight.body.thumbnails.image.height], [240, 240]);
+
+  routes['/page'] = page('<title>Page</title>', '<meta property="og:image" content="/sixteen.png">');
+  const sixteen = await preview(`${base}/page`);
+  assert.equal(sixteen.body.thumbnails.image, null);
+  assert.match(sixteen.log, /image=too_large/);
 });
 
 test('a corrupt or truncated image is refused, not half-decoded', async () => {
@@ -981,6 +1119,27 @@ test('up to three declared icons are tried, in order, before /favicon.ico', asyn
   assert.equal(hitCount('/d.png'), 0);
 });
 
+test('a page with thousands of icon links costs no more than one with a few', async () => {
+  // Unusable links first (SVGs), then duplicates, then a usable one far
+  // beyond where the search stops.
+  const svgs = Array.from({ length: 6000 }, (unused, i) => `<link rel="icon" href="/i/${i}.svg">`).join('');
+  const dupes = '<link rel="icon" href="/same.png">'.repeat(6000);
+  routes['/many'] = page('<title>Many</title>', svgs, dupes, '<link rel="icon" href="/last.png">');
+  routes['/favicon.ico'] = serve(icoFile([{ size: 32, data: icoBitmap(32, 32, [1, 2, 3, 255]) }]), 'image/x-icon');
+  const { body, log } = await preview(`${base}/many`);
+  assert.equal(body.preview.title, 'Many');
+  assert.ok(body.thumbnails.favicon);
+  assert.match(log, /faviconSource=fallback/);
+  assert.deepEqual(hits, ['thumbs.test /many', 'thumbs.test /favicon.ico']);
+
+  // Duplicates within reach are tried once.
+  thumbnailing.cache.clear();
+  hits = [];
+  routes['/few'] = page('<title>Few</title>', '<link rel="icon" href="/same.png">'.repeat(20), '<link rel="icon" href="/other.png">');
+  await preview(`${base}/few`);
+  assert.deepEqual(hits, ['thumbs.test /few', 'thumbs.test /same.png', 'thumbs.test /other.png', 'thumbs.test /favicon.ico']);
+});
+
 // ---- One URL, one fetch ----
 
 test('an image that is also the icon is fetched once and rendered as both', async () => {
@@ -1016,63 +1175,96 @@ test('a shared file within the image cap but over the icon cap is used for the i
   assert.equal(thumbnailing.cache.entries.get(`favicon ${base}/big.png`).value.outcome, 'too_large');
 });
 
-test('identical requests that overlap share one page fetch and one set of images', async () => {
-  let releasePage;
-  const held = new Promise(resolve => { releasePage = resolve; });
-  const servePage = page('<title>Shared</title>', '<meta property="og:image" content="/og.png">', '<link rel="icon" href="/icon.png">');
-  routes['/shared'] = async (req, res) => {
-    await held;
-    servePage(req, res);
-  };
-  routes['/og.png'] = serve(await solid(300, 200).png().toBuffer());
-  routes['/icon.png'] = serve(await solid(32, 32).png().toBuffer());
+test('requests that overlap share one fetch and one decode per image, whatever page names it', async () => {
+  const head = ['<meta property="og:image" content="/site-og.png">', '<link rel="icon" href="/site-icon.png">'];
+  const pages = ['/a', '/b', '/c', '/d'];
+  for (const path of pages) routes[path] = page(`<title>${path}</title>`, ...head);
+  const og = await solid(300, 200).png().toBuffer();
+  const icon = await solid(48, 48).png().toBuffer();
+  const waiting = [];
+  routes['/site-og.png'] = (req, res) => waiting.push(() => serve(og)(req, res));
+  routes['/site-icon.png'] = (req, res) => waiting.push(() => serve(icon)(req, res));
 
-  const first = preview(`${base}/shared`, '&thumbnails=1', from('203.0.113.1'));
-  while (hitCount('/shared') < 1) await new Promise(resolve => setTimeout(resolve, 5));
-  const others = [
-    preview(`${base}/shared`, '&thumbnails=1', from('203.0.113.2')),
-    preview(`${base}/shared#part-two`, '&thumbnails=1', from('203.0.113.3'))
-  ];
-  while (thumbnailing.inFlight.size !== 1) await new Promise(resolve => setTimeout(resolve, 5));
-  await new Promise(resolve => setTimeout(resolve, 100));
-  // A plain preview of the same page is not held up behind them, nor shared.
-  const plain = preview(`${base}/shared`, '');
-  while (hitCount('/shared') < 2) await new Promise(resolve => setTimeout(resolve, 5));
-  releasePage();
-
-  const results = await Promise.all([first, ...others]);
-  assert.deepEqual(Object.keys((await plain).body), ['preview', 'previewStatus']);
-  assert.equal(hitCount('/shared'), 2, 'one fetch for the three thumbnail requests, one for the plain one');
-  assert.equal(hitCount('/og.png'), 1);
-  assert.equal(hitCount('/icon.png'), 1);
-  for (const { status, text } of results) {
-    assert.equal(status, 200);
-    assert.equal(text, results[0].text);
+  let decodes = 0;
+  const restore = withSharp(pipeline => {
+    const realToBuffer = pipeline.toBuffer.bind(pipeline);
+    pipeline.toBuffer = (...args) => { decodes += 1; return realToBuffer(...args); };
+    return pipeline;
+  });
+  let results;
+  try {
+    // Four pages of one site, and one of them asked for twice, from different clients.
+    const requests = [...pages, '/a'].map((path, i) => preview(`${base}${path}`, '&thumbnails=1', from(`203.0.113.${i + 1}`)));
+    while (waiting.length < 2 || thumbnailing.jobs.active < 5) await new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(thumbnailing.inFlight.size, 2);
+    assert.equal(thumbnailing.fetchesInFlight.size, 2);
+    waiting.forEach(release => release());
+    results = await Promise.all(requests);
+  } finally {
+    restore();
   }
-  assert.equal(results[0].body.thumbnailsStatus, 'complete');
-  assert.equal(logLines.filter(line => / shared=1$/.test(line)).length, 2);
-  assert.equal(thumbnailing.inFlight.size, 0);
-  assert.equal(thumbnailing.jobs.active, 0);
+  assert.equal(hitCount('/site-og.png'), 1);
+  assert.equal(hitCount('/site-icon.png'), 1);
+  assert.equal(decodes, 2);
+  // Each request fetched its own page: nothing of a page's text is shared.
+  assert.equal(hitCount('/a'), 2);
+  results.forEach(({ body }, i) => {
+    assert.equal(body.preview.title, [...pages, '/a'][i]);
+    assert.equal(body.thumbnailsStatus, 'complete');
+    assert.deepEqual(body.thumbnails, results[0].body.thumbnails);
+    assert.ok(body.thumbnails.image && body.thumbnails.favicon);
+  });
+  await settled();
 });
 
-test('a shared attempt that throws fails each waiting request and leaves nothing behind', async () => {
-  let releasePage;
-  const held = new Promise(resolve => { releasePage = resolve; });
-  const servePage = page('<title>Shared</title>');
-  routes['/shared'] = async (req, res) => {
-    await held;
-    servePage(req, res);
-  };
+test('a shared fetch that fails gives every waiting request the failure, and leaves nothing behind', async () => {
+  const waiting = [];
+  routes['/flaky.png'] = (req, res) => waiting.push(() => res.writeHead(503).end());
+  for (const path of ['/a', '/b', '/c']) routes[path] = page(`<title>${path}</title>`, '<meta property="og:image" content="/flaky.png">');
+  const requests = ['/a', '/b', '/c'].map((path, i) => preview(`${base}${path}`, '&thumbnails=1', from(`203.0.113.${i + 1}`)));
+  while (waiting.length < 1 || thumbnailing.jobs.active < 3) await new Promise(resolve => setTimeout(resolve, 10));
+  await new Promise(resolve => setTimeout(resolve, 100));
+  waiting.forEach(release => release());
+  for (const { status, body } of await Promise.all(requests)) {
+    assert.equal(status, 200);
+    assert.equal(body.thumbnails.image, null);
+    assert.equal(body.thumbnailsStatus, 'transient');
+  }
+  assert.equal(hitCount('/flaky.png'), 1);
+  await settled();
+});
+
+test('work a request leaves behind at its deadline still finishes, for the cache', async () => {
+  const image = await solid(120, 80).png().toBuffer();
+  routes['/slowish.png'] = (req, res) => setTimeout(() => serve(image)(req, res), 900);
+  routes['/page'] = page('<title>Page</title>', '<meta property="og:image" content="/slowish.png">');
+  thumbnailing.tuning.totalTimeoutMs = 600;
+  let hurried;
+  try {
+    hurried = await preview(`${base}/page`);
+  } finally {
+    thumbnailing.tuning.totalTimeoutMs = 7000;
+  }
+  assert.equal(hurried.body.thumbnails.image, null);
+  assert.equal(hurried.body.thumbnailsStatus, 'transient');
+  assert.match(hurried.log, /image=timeout/);
+  assert.ok(thumbnailing.jobs.active > 0, 'the place is held while the work goes on');
+  await settled();
+  const later = await preview(`${base}/page`);
+  assert.deepEqual([later.body.thumbnails.image.width, later.body.thumbnails.image.height], [120, 80]);
+  assert.match(later.log, /imageCache=hit/);
+  assert.equal(hitCount('/slowish.png'), 1);
+});
+
+test('an unexpected error fails the request cleanly and leaves nothing behind', async () => {
+  routes['/page'] = page('<title>Page</title>');
   const realGet = thumbnailing.engine.get;
   const originalError = console.error;
   console.error = () => {};
   try {
     thumbnailing.engine.get = () => { throw new Error('unexpected'); };
-    const both = [preview(`${base}/shared`), preview(`${base}/shared`)];
-    while (thumbnailing.inFlight.size !== 1) await new Promise(resolve => setTimeout(resolve, 5));
-    await new Promise(resolve => setTimeout(resolve, 100));
-    releasePage();
-    for (const { status, body } of await Promise.all(both)) {
+    for (const { status, body } of await Promise.all([preview(`${base}/page`), preview(`${base}/page`)])) {
       assert.equal(status, 500);
       assert.deepEqual(body, { error: 'Internal server error' });
     }
@@ -1080,11 +1272,8 @@ test('a shared attempt that throws fails each waiting request and leaves nothing
     thumbnailing.engine.get = realGet;
     console.error = originalError;
   }
-  assert.equal(hitCount('/shared'), 1);
-  assert.equal(thumbnailing.inFlight.size, 0);
-  assert.equal(thumbnailing.jobs.active, 0);
-  const after = await preview(`${base}/shared`);
-  assert.equal(after.status, 200);
+  await settled();
+  assert.equal((await preview(`${base}/page`)).status, 200);
 });
 
 // ---- The cache ----
@@ -1228,15 +1417,15 @@ test('cache entries expire, and the cache is bounded by count and by bytes', t =
 
 // ---- Bounds on work in flight ----
 
-test('each client gets two thumbnail jobs at a time, and the bridge twelve; the rest are told "busy"', async () => {
+test('each client gets eight thumbnail jobs at a time, and the bridge sixteen; the rest are told "busy"', async () => {
   const { maxJobs, maxJobsPerClient } = thumbnailing.settings;
-  assert.deepEqual([maxJobsPerClient, maxJobs], [2, 12]);
+  assert.deepEqual([maxJobsPerClient, maxJobs], [8, 16]);
   const image = await solid(300, 300).png().toBuffer();
   const waiting = [];
-  // One file as image and icon, so each job parks exactly one fetch here.
-  routes['/held.png'] = (req, res) => waiting.push(() => serve(image)(req, res));
+  // One file as image and icon per page, so each job parks exactly one fetch here.
   for (let i = 0; i < 20; i += 1) {
-    routes[`/page${i}`] = page(`<title>Page ${i}</title>`, '<meta property="og:image" content="/held.png">', '<link rel="icon" href="/held.png">');
+    routes[`/held${i}.png`] = (req, res) => waiting.push(() => serve(image)(req, res));
+    routes[`/page${i}`] = page(`<title>Page ${i}</title>`, `<meta property="og:image" content="/held${i}.png">`, `<link rel="icon" href="/held${i}.png">`);
   }
   const parked = async count => {
     while (waiting.length < count) await new Promise(resolve => setTimeout(resolve, 10));
@@ -1258,22 +1447,17 @@ test('each client gets two thumbnail jobs at a time, and the bridge twelve; the 
     assert.equal(waiting.length, fetchesBefore, 'a busy request fetches no images');
   };
 
-  // One client fills its own two places...
-  const inFlight = [
-    preview(`${base}/page0`, '&thumbnails=1', from('198.51.100.1')),
-    preview(`${base}/page1`, '&thumbnails=1', from('198.51.100.1'))
-  ];
-  await parked(2);
-  await expectBusy(`${base}/page2`, '198.51.100.1');
+  // The known client's burst: eight lookups at once from one address all get a place...
+  const inFlight = [];
+  for (let i = 0; i < maxJobsPerClient; i += 1) inFlight.push(preview(`${base}/page${i}`, '&thumbnails=1', from('198.51.100.1')));
+  await parked(maxJobsPerClient);
+  // ...and a ninth does not.
+  await expectBusy(`${base}/page18`, '198.51.100.1');
   assert.equal(thumbnailing.cache.entries.size, 0, 'nothing about a busy answer is cached');
 
-  // ...which costs nobody else theirs.
-  inFlight.push(preview(`${base}/page3`, '&thumbnails=1', from('198.51.100.2')));
-  await parked(3);
-
-  // Enough clients fill the bridge as a whole.
-  for (let i = 3; i < maxJobs; i += 1) {
-    inFlight.push(preview(`${base}/page${i + 1}`, '&thumbnails=1', from(`198.51.100.${i + 1}`)));
+  // That costs nobody else theirs, until the bridge as a whole is full.
+  for (let i = maxJobsPerClient; i < maxJobs; i += 1) {
+    inFlight.push(preview(`${base}/page${i}`, '&thumbnails=1', from(`198.51.100.${i}`)));
   }
   await parked(maxJobs);
   await expectBusy(`${base}/page19`, '198.51.100.200');
@@ -1288,51 +1472,54 @@ test('each client gets two thumbnail jobs at a time, and the bridge twelve; the 
     assert.deepEqual([body.thumbnails.image.width, body.thumbnails.image.height], [240, 240]);
     assert.deepEqual([body.thumbnails.favicon.width, body.thumbnails.favicon.height], [32, 32]);
   }
-  for (let i = 0; i < 50 && thumbnailing.jobs.active > 0; i += 1) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.equal(thumbnailing.jobs.active, 0);
-  assert.equal(thumbnailing.jobs.perClient.size, 0);
+  await settled();
 
   // With the jobs done, a client that was turned away now succeeds.
-  const retry = await preview(`${base}/page2`, '&thumbnails=1', from('198.51.100.1'));
+  routes['/held18.png'] = serve(image);
+  const retry = await preview(`${base}/page18`, '&thumbnails=1', from('198.51.100.1'));
   assert.equal(retry.body.thumbnailsStatus, 'complete');
   assert.ok(retry.body.thumbnails.image);
 });
 
-test('"busy" for one client is not handed to another client sharing the request', async () => {
-  const image = await solid(100, 100).png().toBuffer();
+test('a busy request is still given whatever the cache already holds', async () => {
+  const image = await solid(200, 100).png().toBuffer();
+  routes['/known-og.png'] = serve(image);
+  routes['/known-icon.png'] = serve(await solid(32, 32).png().toBuffer());
+  routes['/known'] = page('<title>Known</title>', '<meta property="og:image" content="/known-og.png">', '<link rel="icon" href="/known-icon.png">');
+  routes['/half'] = page('<title>Half</title>', '<meta property="og:image" content="/new-og.png">', '<link rel="icon" href="/known-icon.png">');
+  routes['/new-og.png'] = serve(image);
+  const client = '198.51.100.7';
+  const primed = await preview(`${base}/known`, '&thumbnails=1', from(client));
+  assert.equal(primed.body.thumbnailsStatus, 'complete');
+
+  // Fill every one of the client's places.
   const waiting = [];
-  routes['/held.png'] = (req, res) => waiting.push(() => serve(image)(req, res));
-  routes['/free.png'] = serve(image);
-  routes['/a'] = page('<title>A</title>', '<meta property="og:image" content="/held.png">');
-  routes['/b'] = page('<title>B</title>', '<meta property="og:image" content="/held.png">');
-  let releasePage;
-  const held = new Promise(resolve => { releasePage = resolve; });
-  const servePage = page('<title>Wanted</title>', '<meta property="og:image" content="/free.png">');
-  routes['/wanted'] = async (req, res) => {
-    await held;
-    servePage(req, res);
-  };
+  const inFlight = [];
+  for (let i = 0; i < thumbnailing.settings.maxJobsPerClient; i += 1) {
+    routes[`/held${i}.png`] = (req, res) => waiting.push(() => serve(image)(req, res));
+    routes[`/page${i}`] = page('<title>Held</title>', `<meta property="og:image" content="/held${i}.png">`, `<link rel="icon" href="/held${i}.png">`);
+    inFlight.push(preview(`${base}/page${i}`, '&thumbnails=1', from(client)));
+  }
+  while (waiting.length < thumbnailing.settings.maxJobsPerClient) await new Promise(resolve => setTimeout(resolve, 10));
+  hits = [];
 
-  // The greedy client holds both its places (two fetches each: image, then
-  // the fallback icon behind it, so wait for the two images).
-  const greedy = [preview(`${base}/a`, '&thumbnails=1', from('192.0.2.1')), preview(`${base}/b`, '&thumbnails=1', from('192.0.2.1'))];
-  while (thumbnailing.jobs.active < 2) await new Promise(resolve => setTimeout(resolve, 10));
+  // Everything cached: a full answer, no place needed.
+  const known = await preview(`${base}/known`, '&thumbnails=1', from(client));
+  assert.deepEqual(known.body.thumbnails, primed.body.thumbnails);
+  assert.equal(known.body.thumbnailsStatus, 'complete');
+  assert.match(known.log, /thumbs=complete image=ok imageSource=declared imageMs=0 imageCache=hit favicon=ok faviconSource=declared faviconMs=0 faviconCache=hit$/);
 
-  const leader = preview(`${base}/wanted`, '&thumbnails=1', from('192.0.2.1'));
-  while (thumbnailing.inFlight.size !== 3) await new Promise(resolve => setTimeout(resolve, 5));
-  const follower = preview(`${base}/wanted`, '&thumbnails=1', from('192.0.2.2'));
-  await new Promise(resolve => setTimeout(resolve, 100));
-  releasePage();
-
-  assert.equal((await leader).body.thumbnailsStatus, 'busy');
-  const other = await follower;
-  assert.equal(other.body.thumbnailsStatus, 'complete');
-  assert.ok(other.body.thumbnails.image);
+  // Half cached: the cached half is given, the rest is "busy".
+  const half = await preview(`${base}/half`, '&thumbnails=1', from(client));
+  assert.equal(half.body.thumbnails.image, null);
+  assert.deepEqual(half.body.thumbnails.favicon, primed.body.thumbnails.favicon);
+  assert.equal(half.body.thumbnailsStatus, 'busy');
+  assert.match(half.log, /thumbs=busy image=busy imageMs=0 favicon=ok faviconSource=declared faviconMs=0 faviconCache=hit$/);
+  assert.deepEqual(hits, ['thumbs.test /known', 'thumbs.test /half'], 'only the pages themselves were fetched');
 
   waiting.forEach(release => release());
-  await Promise.all(greedy);
-  for (let i = 0; i < 50 && thumbnailing.jobs.active > 0; i += 1) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.equal(thumbnailing.jobs.active, 0);
+  await Promise.all(inFlight);
+  await settled();
 });
 
 test('no more than two images are decoded at once, however many jobs are running', async () => {
@@ -1366,11 +1553,89 @@ test('no more than two images are decoded at once, however many jobs are running
       assert.equal(body.thumbnailsStatus, 'complete');
       assert.ok(body.thumbnails.image && body.thumbnails.favicon);
     }
+    await settled();
   } finally {
     restore();
   }
   assert.equal(decodes, thumbnailing.settings.maxJobs * 2);
   assert.equal(mostAtOnce, thumbnailing.settings.maxDecodes);
+});
+
+test('turns at decoding are shared fairly between clients', async () => {
+  const gate = thumbnailing.decodeGate;
+  const order = [];
+  const finish = {};
+  const never = new AbortController().signal;
+  const task = (client, name) => gate.run(client, never, () => new Promise(resolve => {
+    order.push(name);
+    finish[name] = resolve;
+  }));
+  const tick = () => new Promise(resolve => setImmediate(resolve));
+
+  // A greedy client takes both turns while nobody else wants one, and queues more.
+  const all = [task('greedy', 'g1'), task('greedy', 'g2'), task('greedy', 'g3'), task('greedy', 'g4'), task('greedy', 'g5')];
+  await tick();
+  assert.deepEqual(order, ['g1', 'g2']);
+  // Two others arrive later, behind three of the greedy client's.
+  all.push(task('second', 's1'), task('second', 's2'), task('third', 't1'));
+  await tick();
+
+  // Each turn that frees goes to a client holding fewer, in rotation.
+  finish.g1();
+  await tick();
+  assert.deepEqual(order.slice(2), ['s1'], 'the first freed turn goes to a waiting client, not back to the greedy one');
+  assert.equal(gate.held.get('greedy'), 1);
+  finish.g2();
+  await tick();
+  assert.deepEqual(order.slice(2), ['s1', 't1'], 'and the second to the other one');
+  assert.equal(gate.held.has('greedy'), false, 'the greedy client holds nothing while others were waiting');
+  finish.s1();
+  await tick();
+  assert.deepEqual(order.slice(2), ['s1', 't1', 'g3'], 'then the greedy client gets a turn of its own');
+  finish.t1();
+  await tick();
+  assert.deepEqual(order.slice(2), ['s1', 't1', 'g3', 's2'], 'but not a second one while someone else waits');
+  finish.g3();
+  await tick();
+  finish.s2();
+  await tick();
+  assert.deepEqual(order.slice(2), ['s1', 't1', 'g3', 's2', 'g4', 'g5']);
+  assert.equal(gate.active, 2);
+  finish.g4();
+  finish.g5();
+  await Promise.all(all);
+  assert.deepEqual([gate.active, gate.held.size, gate.queues.size, gate.lastTurn.size], [0, 0, 0, 0]);
+});
+
+test('a wait for a decoding turn ends at its deadline, and a failed decode gives its turn back', async () => {
+  const gate = thumbnailing.decodeGate;
+  const never = new AbortController().signal;
+  let release;
+  const holders = [
+    gate.run('a', never, () => new Promise(resolve => { release = resolve; })),
+    gate.run('a', never, () => Promise.reject(new Error('decode failed')))
+  ];
+  await assert.rejects(holders[1], /decode failed/);
+  assert.equal(gate.active, 1);
+
+  let releaseSecond;
+  const second = gate.run('a', never, () => new Promise(resolve => { releaseSecond = resolve; }));
+  const impatient = new AbortController();
+  let ran = false;
+  const waiter = gate.run('b', impatient.signal, async () => { ran = true; });
+  const alreadyLate = gate.run('c', AbortSignal.abort(), async () => { ran = true; });
+  await assert.rejects(alreadyLate, { outcome: 'decode_timeout' });
+  assert.equal(gate.queues.size, 1);
+  impatient.abort();
+  await assert.rejects(waiter, { outcome: 'decode_timeout' });
+  assert.equal(ran, false);
+  assert.equal(gate.queues.size, 0, 'the abandoned wait is taken out of the queue');
+  assert.equal(gate.active, 2);
+
+  release();
+  releaseSecond();
+  await Promise.all([holders[0], second]);
+  assert.deepEqual([gate.active, gate.held.size, gate.queues.size, gate.lastTurn.size], [0, 0, 0, 0]);
 });
 
 // ---- Decodes that run out of time ----
@@ -1456,8 +1721,7 @@ test('a decode still waiting its turn at the deadline is given up, and counts as
     }
     // Places are held until the slow decodes really end, then given back.
     assert.ok(thumbnailing.jobs.active > 0);
-    for (let i = 0; i < 200 && thumbnailing.jobs.active > 0; i += 1) await new Promise(resolve => setTimeout(resolve, 10));
-    assert.equal(thumbnailing.jobs.active, 0);
+    await settled();
   } finally {
     restore();
   }
@@ -1466,6 +1730,56 @@ test('a decode still waiting its turn at the deadline is given up, and counts as
   // against the images that never got a turn.
   const outcomes = [...thumbnailing.cache.entries.values()].map(entry => entry.value.outcome);
   assert.deepEqual(outcomes, ['ok', 'ok']);
+});
+
+// ---- The request's whole allowance ----
+
+test('page fetch and thumbnails share one allowance; thumbnails get what the page left', async () => {
+  const { phaseTimeoutMs } = thumbnailing.settings;
+  assert.equal(thumbnailing.tuning.totalTimeoutMs, 7000);
+  assert.equal(phaseTimeoutMs, 4000);
+  const servePage = page('<title>Slow page</title>', '<meta property="og:image" content="/silent.png">', '<link rel="icon" href="/icon.png">');
+  // The page takes 3.6 s of the 7 s, leaving the thumbnails 3.4 s, not their usual 4.
+  routes['/slow-page'] = (req, res) => setTimeout(() => servePage(req, res), 3600);
+  routes['/silent.png'] = () => { /* never answers */ };
+  routes['/icon.png'] = serve(await solid(32, 32).png().toBuffer());
+
+  const startedAt = Date.now();
+  const { body, log } = await preview(`${base}/slow-page`);
+  const elapsed = Date.now() - startedAt;
+  assert.equal(body.preview.title, 'Slow page');
+  assert.equal(body.thumbnails.image, null);
+  assert.ok(body.thumbnails.favicon);
+  assert.equal(body.thumbnailsStatus, 'transient');
+  assert.match(log, /image=timeout imageMs=3[0-4]\d\d /);
+  assert.ok(elapsed >= 6800 && elapsed < 7400, `took ${elapsed}ms; expected about 7000`);
+});
+
+test('with almost nothing left, only the cache is consulted', async () => {
+  const servePage = page('<title>Late page</title>', '<meta property="og:image" content="/og.png">', '<link rel="icon" href="/icon.png">');
+  routes['/quick'] = page('<title>Quick</title>', '<link rel="icon" href="/icon.png">');
+  routes['/late-page'] = (req, res) => setTimeout(() => servePage(req, res), 400);
+  routes['/og.png'] = serve(await solid(100, 100).png().toBuffer());
+  routes['/icon.png'] = serve(await solid(32, 32).png().toBuffer());
+  const primed = await preview(`${base}/quick`);
+  assert.ok(primed.body.thumbnails.favicon);
+  hits = [];
+
+  // 400 ms of a 700 ms allowance gone: under the 500 ms it takes to be worth starting.
+  thumbnailing.tuning.totalTimeoutMs = 700;
+  let late;
+  try {
+    late = await preview(`${base}/late-page`);
+  } finally {
+    thumbnailing.tuning.totalTimeoutMs = 7000;
+  }
+  assert.equal(late.body.preview.title, 'Late page');
+  assert.equal(late.body.thumbnails.image, null);
+  assert.deepEqual(late.body.thumbnails.favicon, primed.body.thumbnails.favicon);
+  assert.equal(late.body.thumbnailsStatus, 'transient');
+  assert.match(late.log, /thumbs=transient image=timeout imageMs=0 favicon=ok faviconSource=declared faviconMs=0 faviconCache=hit$/);
+  assert.deepEqual(hits, ['thumbs.test /late-page'], 'no image was fetched');
+  assert.equal(thumbnailing.jobs.active, 0);
 });
 
 // ---- Without the image library ----

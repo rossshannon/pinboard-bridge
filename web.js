@@ -3,6 +3,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const crypto = require('crypto');
 const dns = require('dns');
 const helmet = require('helmet');
@@ -578,24 +579,29 @@ const guardedGet = async (url, config) => {
   }
   return axios.get(target.toString(), {
     ...config,
-    // One request per connection. A response that has ended by the time we
-    // are done with it would otherwise be handed back to the keep-alive pool,
-    // where destroying the request no longer reaches it, leaving an idle
-    // socket open to a host somebody else chose.
-    headers: { ...config.headers, Connection: 'close' },
+    ...guardedAgents,
     maxRedirects: 3,
     lookup: guardedLookup,
     beforeRedirect: guardRedirect
   });
 };
 
-// Hang up on a guarded fetch, read or not. Destroying axios's stream wrapper
-// alone leaves the socket open, so the request and its socket go too.
+// Guarded fetches get agents of their own that never keep a connection
+// alive. With the default agent, a response that has ended by the time we
+// are done with it is handed back to the keep-alive pool, where destroying
+// the request no longer reaches it, leaving an idle socket open to a host
+// somebody else chose. The agents still connect through the `lookup` each
+// request carries, so the DNS guard applies as before.
+const guardedAgents = {
+  httpAgent: new http.Agent({ keepAlive: false }),
+  httpsAgent: new https.Agent({ keepAlive: false })
+};
+
+// Hang up on a guarded fetch that may not have finished. Destroying axios's
+// stream wrapper alone leaves the socket open, so the request goes too.
 const tearDownResponse = response => {
   response?.request?.destroy?.();
   response?.data?.destroy?.();
-  response?.request?.socket?.destroy?.();
-  response?.request?.res?.socket?.destroy?.();
 };
 
 // Resolve a page-supplied link, keeping only http(s): a javascript: or data:
@@ -676,26 +682,33 @@ const selectFavicon = ($) => {
 // The icons a page declares that a thumbnail could be made from, best first.
 // selectFavicon's choice for preview.faviconUrl may be an SVG or a mask icon,
 // which are never decoded, so those are left out here and the page's other
-// icons get their turn.
+// icons get their turn. Only thumbnail requests pay for this. A page can
+// declare any number of icons: the search stops at the first few usable
+// ones, and looks at no more than a fixed number of links to find them.
 const MAX_ICON_CANDIDATES = 3;
+const MAX_ICON_LINKS_EXAMINED = 30;
 const selectIconCandidates = ($, pageUrl) => {
-  const found = [];
+  const found = new Set();
+  let examined = 0;
   for (const selector of FAVICON_SELECTORS) {
     if (selector.includes('svg') || selector.includes('mask-icon')) continue;
-    $(selector).each((index, element) => {
-      const type = ($(element).attr('type') || '').toLowerCase();
-      const url = resolveAbsoluteUrl(pageUrl, ($(element).attr('href') || '').trim());
-      if (!url || type.includes('svg') || /\.svgz?$/i.test(new URL(url).pathname) || found.includes(url)) return;
-      found.push(url);
-    });
+    for (const element of $(selector).slice(0, MAX_ICON_LINKS_EXAMINED - examined).toArray()) {
+      examined += 1;
+      const type = (element.attribs.type || '').toLowerCase();
+      const url = resolveAbsoluteUrl(pageUrl, (element.attribs.href || '').trim());
+      if (!url || type.includes('svg') || /\.svgz?$/i.test(new URL(url).pathname)) continue;
+      found.add(url);
+      if (found.size >= MAX_ICON_CANDIDATES) return [...found];
+    }
+    if (examined >= MAX_ICON_LINKS_EXAMINED) break;
   }
-  return found.slice(0, MAX_ICON_CANDIDATES);
+  return [...found];
 };
 
 // Returns the preview (null when the page has no title, description or
-// image) together with the icons a thumbnail can use, which a page may
+// image) and, when asked, the icons a thumbnail can use, which a page may
 // declare even when it has no preview.
-const extractPageMetadata = (html, finalUrl, originalUrl) => {
+const extractPageMetadata = (html, finalUrl, originalUrl, wantIcons) => {
   const $ = cheerio.load(html);
 
   const title = pickMetaValue($, 'meta[name="twitter:title"]')
@@ -748,7 +761,7 @@ const extractPageMetadata = (html, finalUrl, originalUrl) => {
   const rawFavicon = selectFavicon($);
   const faviconUrl = resolveAbsoluteUrl(pageUrl, rawFavicon);
 
-  const iconCandidates = selectIconCandidates($, pageUrl);
+  const iconCandidates = wantIcons ? selectIconCandidates($, pageUrl) : [];
 
   if (!title && !description && !imageUrl) {
     return { preview: null, iconCandidates };
@@ -866,8 +879,8 @@ const readHead = async data => {
 };
 
 // Fetch a page and read its head. Resolves to the preview, the URL the page
-// was finally served from and the icons it declares.
-const fetchPreviewPage = async targetUrl => {
+// was finally served from and, with `icons`, the icons it declares.
+const fetchPreviewPage = async (targetUrl, { icons = false } = {}) => {
   // One deadline for the whole fetch (redirects and body included), not just
   // for each socket going quiet.
   const controller = new AbortController();
@@ -881,11 +894,16 @@ const fetchPreviewPage = async targetUrl => {
     const finalUrl = response.request?.res?.responseUrl || targetUrl.toString();
     const contentType = response.headers['content-type'] || '';
     if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
-      throw new Error('Preview response is not HTML');
+      const notHtml = new Error('Preview response is not HTML');
+      notHtml.code = 'ENOTHTML';
+      // A success from a host we were allowed to reach: its origin can still
+      // be asked for an icon.
+      if (response.status < 300) notHtml.finalUrl = finalUrl;
+      throw notHtml;
     }
 
     const body = await readHead(response.data);
-    return { ...extractPageMetadata(body, finalUrl, targetUrl.toString()), finalUrl };
+    return { ...extractPageMetadata(body, finalUrl, targetUrl.toString(), icons), finalUrl };
   } catch (error) {
     // A 4xx/5xx rejects with the unread response attached; it needs tearing
     // down just the same.
@@ -894,7 +912,9 @@ const fetchPreviewPage = async targetUrl => {
       throw new Error(`Preview fetch timed out after ${PREVIEW_TIMEOUT_MS}ms`);
     }
     if (isPrivateAddressError(error)) {
-      throw new Error('URL host is not reachable from the proxy');
+      const blocked = new Error('URL host is not reachable from the proxy');
+      blocked.code = 'EPRIVATEADDRESS';
+      throw blocked;
     }
     throw error;
   } finally {
@@ -912,21 +932,32 @@ const fetchPreview = async targetUrl => (await fetchPreviewPage(targetUrl)).prev
 // the page, so it is treated as hostile: the fetch goes through guardedGet,
 // the body is capped, only a short list of formats is decoded, and what goes
 // back is always our own re-encoding, never the origin's bytes.
-const THUMBNAIL_PHASE_TIMEOUT_MS = 4000; // image and icon together, after the page fetch
-// Requests fetching for thumbnails at once: a couple per client (the client
-// IP, as the rate limiters see it), so no one caller can take every place,
-// and a ceiling overall. One over either gets null thumbnails rather than
-// waiting.
-const THUMBNAIL_MAX_JOBS_PER_CLIENT = 2;
-const THUMBNAIL_MAX_JOBS = 12;
-// Decodes running at once: the scarce thing. A hostile image can need its
-// whole pixel area in memory, so this and the pixel limits below bound what
-// a Basic dyno can be made to hold. Decodes beyond it wait, up to the
-// deadline.
+// Image and icon together get this long, or what is left of the request's
+// whole allowance (thumbnailTuning.totalTimeoutMs) after the page fetch if
+// that is less. With less than the minimum left, only the cache is consulted.
+const THUMBNAIL_PHASE_TIMEOUT_MS = 4000;
+const THUMBNAIL_MIN_PHASE_MS = 500;
+// Requests fetching for thumbnails at once, per client (the client IP, as
+// the rate limiters see it) and overall. One over either gets only what is
+// already cached rather than waiting. A client showing a page of results
+// asks for several at once, so its share is generous; what is scarce is
+// decoding, below.
+const THUMBNAIL_MAX_JOBS_PER_CLIENT = 8;
+const THUMBNAIL_MAX_JOBS = 16;
+// Decodes running at once. A hostile image can need its whole canvas in
+// memory, so this and the limits below bound what a 512 MB dyno can be made
+// to hold. Decodes beyond it wait their turn, up to the deadline.
 const THUMBNAIL_MAX_DECODES = 2;
+// maxPixels bounds the canvas and maxDecodedBytes its size once decoded
+// (width x height x channels x bytes per sample), which is what a 16-bit
+// image doubles. Measured with two decodes at once (the most the gate
+// allows) of the costliest file each format permits at these limits, peak
+// memory rose by about 115 MB over an idle process (interlaced PNG, 16-bit
+// PNG and GIF are the worst; JPEG and WebP much less). At the earlier 16
+// megapixels with no size limit, two 16-bit interlaced PNGs took 320 MB.
 const THUMBNAIL_KINDS = {
-  image: { maxBytes: 2 * 1024 * 1024, maxPixels: 16 * 1000 * 1000, size: 240, mime: 'image/webp' },
-  favicon: { maxBytes: 512 * 1024, maxPixels: 4 * 1000 * 1000, size: 32, mime: 'image/png' }
+  image: { maxBytes: 2 * 1024 * 1024, maxPixels: 9 * 1000 * 1000, maxDecodedBytes: 36 * 1000 * 1000, size: 240, mime: 'image/webp' },
+  favicon: { maxBytes: 512 * 1024, maxPixels: 2 * 1000 * 1000, maxDecodedBytes: 8 * 1000 * 1000, size: 32, mime: 'image/png' }
 };
 const ICO_MAX_ENTRIES = 64;
 const ICO_MAX_DIMENSION = 256;
@@ -937,8 +968,14 @@ const THUMBNAIL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 // How long a URL that gave no thumbnail is left alone before it is tried
 // again.
 const THUMBNAIL_CACHE_RETRY_TTL_MS = 5 * 60 * 1000;
-// Read by each decode, so tests can shorten it.
-const thumbnailTuning = { decodeTimeoutSeconds: 3 };
+// Read on each use, so tests can shorten them. totalTimeoutMs is how long a
+// thumbnail request may take from its start, page fetch included; clients
+// are expected to allow a little more than this before giving up.
+// decodeTimeoutSeconds is a backstop only: libvips checks it between stages
+// of its work, not inside a decoder, so it can't cut a decode short. What
+// bounds a decode is the byte and pixel limits: the slowest file they allow
+// (a 9-megapixel progressive JPEG of 2 MB) decodes in about 0.1 s.
+const thumbnailTuning = { decodeTimeoutSeconds: 3, totalTimeoutMs: 7000 };
 
 // sharp is a native module. It is loaded on first use, not at startup, so
 // that a missing or broken binary costs only the thumbnails: the proxy,
@@ -963,8 +1000,7 @@ const thumbnailEngine = {
             'VipsForeignLoadPngBuffer',
             'VipsForeignLoadJpegBuffer',
             'VipsForeignLoadNsgifBuffer',
-            'VipsForeignLoadWebpBuffer',
-            'VipsForeignLoadHeifBuffer'
+            'VipsForeignLoadWebpBuffer'
           ]
         });
         this.sharp = sharp;
@@ -980,7 +1016,7 @@ const thumbnailEngine = {
 const thumbnailRequestConfig = {
   responseType: 'stream',
   headers: {
-    Accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif,image/x-icon;q=0.9,*/*;q=0.5',
+    Accept: 'image/webp,image/png,image/jpeg,image/gif,image/x-icon;q=0.9,*/*;q=0.5',
     'User-Agent': USER_AGENT
   },
   validateStatus: status => status >= 200 && status < 300,
@@ -1062,27 +1098,18 @@ const startsWith = (buffer, bytes, offset = 0) =>
 
 // Decide what a file is from its first bytes; the Content-Type header and the
 // URL's extension are the origin's say-so and count for nothing. Anything not
-// listed (SVG and HTML included) is null.
+// listed is null: SVG and HTML, and also AVIF and HEIF, whose decoder can be
+// made to hold hundreds of megabytes by a file of a few hundred bytes.
 const sniffImageFormat = buffer => {
   if (startsWith(buffer, PNG_MAGIC)) return 'png';
   if (startsWith(buffer, Buffer.from([0xff, 0xd8, 0xff]))) return 'jpeg';
   if (startsWith(buffer, Buffer.from('GIF87a')) || startsWith(buffer, Buffer.from('GIF89a'))) return 'gif';
   if (startsWith(buffer, Buffer.from('RIFF')) && startsWith(buffer, Buffer.from('WEBP'), 8)) return 'webp';
-  if (startsWith(buffer, Buffer.from('ftyp'), 4)) {
-    // An ISO media file: AVIF if its major or a compatible brand says so.
-    const boxEnd = Math.min(buffer.readUInt32BE(0), buffer.length, 64);
-    for (let at = 8; at + 4 <= boxEnd; at += 4) {
-      if (at === 12) continue; // the minor version, not a brand
-      const brand = buffer.toString('latin1', at, at + 4);
-      if (brand === 'avif' || brand === 'avis') return 'avif';
-    }
-    return null;
-  }
   if (startsWith(buffer, Buffer.from([0, 0, 1, 0]))) return 'ico';
   return null;
 };
 // What sharp calls each format once it has opened it.
-const SHARP_FORMAT_NAMES = { png: 'png', jpeg: 'jpeg', gif: 'gif', webp: 'webp', avif: 'heif' };
+const SHARP_FORMAT_NAMES = { png: 'png', jpeg: 'jpeg', gif: 'gif', webp: 'webp' };
 
 // Decode one ICO entry stored as a bitmap: an uncompressed DIB (1-, 4- or
 // 8-bit with a colour table, or 24- or 32-bit) followed by a 1-bit
@@ -1192,25 +1219,74 @@ const pickIcoImages = (buffer, targetSize) => {
   return images;
 };
 
-// At most `max` calls run at once; the rest wait their turn.
-const createGate = max => {
-  let active = 0;
-  const waiting = [];
-  return async fn => {
-    if (active >= max) {
-      await new Promise(resolve => waiting.push(resolve)); // woken holding a slot
+// Turns at decoding, shared fairly between clients. At most `max` run at
+// once. A freed turn goes to the waiting client that holds fewest and, among
+// those, the one that has gone longest without one, so one client's backlog
+// can't keep both turns while anyone else is waiting. A wait ends early, with
+// decode_timeout, if its signal fires.
+const createFairGate = max => {
+  const gate = { active: 0, held: new Map(), queues: new Map(), lastTurn: new Map(), turns: 0 };
+  const grant = client => {
+    gate.active += 1;
+    gate.turns += 1;
+    gate.held.set(client, (gate.held.get(client) || 0) + 1);
+    gate.lastTurn.set(client, gate.turns);
+  };
+  const before = (a, b) => {
+    const heldA = gate.held.get(a) || 0;
+    const heldB = gate.held.get(b) || 0;
+    return heldA !== heldB ? heldA < heldB : (gate.lastTurn.get(a) || 0) < (gate.lastTurn.get(b) || 0);
+  };
+  const release = client => {
+    gate.active -= 1;
+    const mine = gate.held.get(client) - 1;
+    if (mine > 0) gate.held.set(client, mine); else gate.held.delete(client);
+    let next = null;
+    for (const waiting of gate.queues.keys()) {
+      if (next === null || before(waiting, next)) next = waiting;
+    }
+    if (next !== null) {
+      const queue = gate.queues.get(next);
+      const entry = queue.shift();
+      if (queue.length === 0) gate.queues.delete(next);
+      grant(next);
+      entry.start();
+    }
+    // A client with nothing running or waiting is forgotten.
+    if (!gate.held.has(client) && !gate.queues.has(client)) gate.lastTurn.delete(client);
+  };
+  gate.run = async (client, signal, fn) => {
+    if (gate.active < max) {
+      grant(client);
     } else {
-      active += 1;
+      await new Promise((resolve, reject) => {
+        if (signal.aborted) return reject(thumbnailError('decode_timeout'));
+        const entry = {};
+        const onAbort = () => {
+          const queue = gate.queues.get(client);
+          queue.splice(queue.indexOf(entry), 1);
+          if (queue.length === 0) gate.queues.delete(client);
+          if (!gate.held.has(client) && !gate.queues.has(client)) gate.lastTurn.delete(client);
+          reject(thumbnailError('decode_timeout'));
+        };
+        entry.start = () => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(); // woken holding a turn
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (!gate.queues.has(client)) gate.queues.set(client, []);
+        gate.queues.get(client).push(entry);
+      });
     }
     try {
       return await fn();
     } finally {
-      const next = waiting.shift();
-      if (next) next(); else active -= 1;
+      release(client);
     }
   };
+  return gate;
 };
-const thumbnailDecodeGate = createGate(THUMBNAIL_MAX_DECODES);
+const thumbnailDecodeGate = createFairGate(THUMBNAIL_MAX_DECODES);
 
 // Decode one input with sharp and re-encode it as the thumbnail for `kind`.
 const encodeThumbnail = async (sharp, kind, input) => {
@@ -1219,9 +1295,19 @@ const encodeThumbnail = async (sharp, kind, input) => {
   const options = { limitInputPixels: spec.maxPixels, failOn: 'error', sequentialRead: true, pages: 1, raw: input.raw };
   try {
     if (!input.raw) {
+      // Reading the header decodes nothing, so it is done without sharp's own
+      // pixel limit and the limits are applied here, where they can be told
+      // apart from a broken file.
+      const metadata = await sharp(input.bytes, { ...options, limitInputPixels: false }).metadata();
       // The loader libvips chose must be the one the first bytes promised.
-      const metadata = await sharp(input.bytes, options).metadata();
       if (metadata.format !== SHARP_FORMAT_NAMES[input.format]) throw thumbnailError('unsupported');
+      // Refuse from the header anything that would decode to too much: by
+      // area, and by size in memory, which a 16-bit image doubles.
+      const sampleBytes = { uchar: 1, char: 1, ushort: 2, short: 2 }[metadata.depth] || 4;
+      const pixels = metadata.width * metadata.height;
+      if (!(pixels <= spec.maxPixels) || !(pixels * metadata.channels * sampleBytes <= spec.maxDecodedBytes)) {
+        throw thumbnailError('too_large');
+      }
     }
     // Nothing of the original's metadata is carried over: sharp drops EXIF,
     // ICC and the rest unless asked to keep them.
@@ -1240,8 +1326,9 @@ const encodeThumbnail = async (sharp, kind, input) => {
   }
 };
 
-// Turn fetched bytes into a thumbnail: { dataUri, width, height }.
-const renderThumbnail = async (sharp, kind, bytes, signal) => {
+// Turn fetched bytes into a thumbnail: { dataUri, width, height }. `client`
+// is whose turn at decoding this takes.
+const renderThumbnail = async (sharp, kind, bytes, client, signal) => {
   const format = sniffImageFormat(bytes);
   let inputs;
   if (format === 'ico') {
@@ -1256,10 +1343,10 @@ const renderThumbnail = async (sharp, kind, bytes, signal) => {
   }
   if (inputs.length === 0) throw thumbnailError('unsupported');
 
-  return thumbnailDecodeGate(async () => {
+  return thumbnailDecodeGate.run(client, signal, async () => {
     let failure;
     for (const input of inputs) {
-      // The wait for a turn, or an earlier entry, may have used up the time.
+      // An earlier entry may have used up the time.
       if (signal.aborted) throw thumbnailError('decode_timeout');
       try {
         return await encodeThumbnail(sharp, kind, input);
@@ -1312,37 +1399,109 @@ const thumbnailCache = {
   }
 };
 
+// Image fetches and thumbnails in the making, so that requests wanting the
+// same thing at the same moment (several pages of one site, each naming the
+// site's icon) share one fetch and one decode. Each piece of work has a
+// deadline of its own rather than its first requester's: a request that runs
+// out of time leaves it to finish for the cache and for anyone else waiting.
+// Entries always clear themselves, and every waiter gets the outcome.
+const imageFetchesInFlight = new Map(); // "maxBytes url" -> promise of the bytes
+const thumbnailsInFlight = new Map(); // "kind url", as in the cache -> promise of { thumbnail, outcome }
+
+const sharedImageFetch = (url, maxBytes) => {
+  const key = `${maxBytes} ${url}`;
+  let pending = imageFetchesInFlight.get(key);
+  if (!pending) {
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), THUMBNAIL_PHASE_TIMEOUT_MS);
+    pending = fetchImageBytes(url, maxBytes, controller.signal)
+      .catch(error => {
+        // Settle on the outcome here, while the signal can still tell a
+        // timeout from any other failure.
+        throw thumbnailError(thumbnailOutcome(error, controller.signal));
+      })
+      .finally(() => {
+        clearTimeout(deadline);
+        imageFetchesInFlight.delete(key);
+      });
+    imageFetchesInFlight.set(key, pending);
+  }
+  return pending;
+};
+
+// Fetch and render one thumbnail and record the answer. Never rejects.
+const makeThumbnail = async (sharp, kind, url, fetchMaxBytes, client) => {
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), THUMBNAIL_PHASE_TIMEOUT_MS);
+  let result;
+  try {
+    const bytes = await sharedImageFetch(url, fetchMaxBytes);
+    // The fetch may have been made under the image's larger cap.
+    if (bytes.length > THUMBNAIL_KINDS[kind].maxBytes) throw thumbnailError('too_large');
+    result = { thumbnail: await renderThumbnail(sharp, kind, bytes, client, controller.signal), outcome: 'ok' };
+  } catch (error) {
+    result = { thumbnail: null, outcome: thumbnailOutcome(error, controller.signal) };
+  } finally {
+    clearTimeout(deadline);
+  }
+  // A decode that ran out of time says more about us than about the image,
+  // so it isn't held against the URL.
+  if (result.outcome !== 'decode_timeout') {
+    thumbnailCache.set(`${kind} ${url}`, result, result.thumbnail ? THUMBNAIL_CACHE_TTL_MS : THUMBNAIL_CACHE_RETRY_TTL_MS);
+  }
+  return result;
+};
+
+// Join the making of a thumbnail, or start it. `started` says which.
+const sharedThumbnail = (sharp, kind, url, fetchMaxBytes, client) => {
+  const key = `${kind} ${url}`;
+  let pending = thumbnailsInFlight.get(key);
+  if (pending) return { pending, started: false };
+  pending = makeThumbnail(sharp, kind, url, fetchMaxBytes, client)
+    .catch(() => ({ thumbnail: null, outcome: 'error' }))
+    .finally(() => thumbnailsInFlight.delete(key));
+  thumbnailsInFlight.set(key, pending);
+  return { pending, started: true };
+};
+
+const noThumbnail = (outcome, ms = 0) =>
+  ({ thumbnail: null, outcome, source: null, cached: false, transient: isTransientOutcome(outcome), ms });
+
+// Answer for one kind from the cache alone: the thumbnail of the first
+// candidate that has one, or the last failure if every candidate is known to
+// have failed. Null if a candidate would have to be fetched to know.
+const settleFromCache = (kind, candidates) => {
+  let outcome = 'none'; // nothing to fetch
+  let transient = false;
+  for (const { source, url } of candidates) {
+    const result = thumbnailCache.get(`${kind} ${url}`);
+    if (!result) return null;
+    if (result.thumbnail) {
+      return { thumbnail: result.thumbnail, outcome: 'ok', source, cached: true, transient: false, ms: 0 };
+    }
+    outcome = result.outcome;
+    transient = transient || isTransientOutcome(outcome);
+  }
+  return { thumbnail: null, outcome, source: null, cached: candidates.length > 0, transient, ms: 0 };
+};
+
 // Try each candidate URL in turn until one makes a thumbnail. `job` carries
-// what the two kinds share: sharp, the deadline's signal and the fetches
-// already started. Never rejects.
+// what the request's two kinds share. Never rejects.
 const settleThumbnail = async (kind, candidates, job) => {
   const startedAt = Date.now();
-  const spec = THUMBNAIL_KINDS[kind];
-  let outcome = 'none'; // nothing to fetch
+  let outcome = 'none';
   let transient = false;
   let cached = false;
   for (const { source, url } of candidates) {
-    const cacheKey = `${kind} ${url}`;
-    let result = thumbnailCache.get(cacheKey);
+    let result = thumbnailCache.get(`${kind} ${url}`);
     cached = Boolean(result);
     if (!result) {
-      const attemptStartedAt = Date.now();
-      try {
-        const bytes = await job.fetch(url);
-        // The fetch may have been made with the other kind's larger cap.
-        if (bytes.length > spec.maxBytes) throw thumbnailError('too_large');
-        result = { thumbnail: await renderThumbnail(job.sharp, kind, bytes, job.signal), outcome: 'ok' };
-      } catch (error) {
-        result = { thumbnail: null, outcome: thumbnailOutcome(error, job.signal) };
-      }
-      // A URL that ran out of time is only held against it if it had a fair
-      // share of the time; a decode that timed out says more about us.
-      const hadItsChance = result.outcome === 'timeout'
-        ? Date.now() - attemptStartedAt >= THUMBNAIL_PHASE_TIMEOUT_MS / 2
-        : result.outcome !== 'decode_timeout';
-      if (hadItsChance) {
-        thumbnailCache.set(cacheKey, result, result.thumbnail ? THUMBNAIL_CACHE_TTL_MS : THUMBNAIL_CACHE_RETRY_TTL_MS);
-      }
+      // A URL wanted as both image and icon is fetched once, under the
+      // image's cap; the icon then applies its own smaller cap to the bytes.
+      const fetchMaxBytes = (url === job.imageUrl ? THUMBNAIL_KINDS.image : THUMBNAIL_KINDS.favicon).maxBytes;
+      const { pending, started } = sharedThumbnail(job.sharp, kind, url, fetchMaxBytes, job.client);
+      if (started) job.started.push(pending);
+      result = await Promise.race([pending, job.expired]);
     }
     if (result.thumbnail) {
       return { thumbnail: result.thumbnail, outcome: 'ok', source, cached, transient: false, ms: Date.now() - startedAt };
@@ -1353,9 +1512,6 @@ const settleThumbnail = async (kind, candidates, job) => {
   }
   return { thumbnail: null, outcome, source: null, cached, transient, ms: Date.now() - startedAt };
 };
-
-const noThumbnail = (outcome, ms = 0) =>
-  ({ thumbnail: null, outcome, source: null, cached: false, transient: isTransientOutcome(outcome), ms });
 
 // Places for requests that are fetching images, counted per client and
 // overall.
@@ -1376,20 +1532,9 @@ const thumbnailJobs = {
   }
 };
 
-// Build both thumbnails for a fetched page, in parallel, under one deadline.
-// Resolves to { image, favicon }, each as settleThumbnail returns; never
-// rejects.
-const buildThumbnails = async (page, sharp, client) => {
-  if (!thumbnailJobs.acquire(client)) {
-    return { image: noThumbnail('busy'), favicon: noThumbnail('busy') };
-  }
-  const controller = new AbortController();
-  const signal = controller.signal;
-  const deadline = setTimeout(() => controller.abort(), THUMBNAIL_PHASE_TIMEOUT_MS);
-  const expired = new Promise(resolve => {
-    signal.addEventListener('abort', () => resolve(noThumbnail('timeout', THUMBNAIL_PHASE_TIMEOUT_MS)), { once: true });
-  });
-
+// Build both thumbnails for a page, in parallel, within budgetMs. Resolves
+// to { image, favicon }, each as settleThumbnail returns; never rejects.
+const buildThumbnails = async (page, sharp, client, budgetMs) => {
   const imageUrl = page.preview?.imageUrl || null;
   const imageCandidates = imageUrl ? [{ source: 'declared', url: imageUrl }] : [];
   // The page's own raster icons first, then /favicon.ico on the origin the
@@ -1400,59 +1545,80 @@ const buildThumbnails = async (page, sharp, client) => {
     faviconCandidates.push({ source: 'fallback', url: fallbackIcon });
   }
 
-  // A URL wanted as both image and icon is fetched once, under the image's
-  // cap; the icon then applies its own smaller cap to what arrived.
-  const fetches = new Map();
+  // What the cache already knows costs nothing, so it is looked at before
+  // deciding whether there is time or room to do more.
+  const known = {
+    image: settleFromCache('image', imageCandidates),
+    favicon: settleFromCache('favicon', faviconCandidates)
+  };
+  if (known.image && known.favicon) return known;
+  const knownOr = outcome => ({ image: known.image || noThumbnail(outcome), favicon: known.favicon || noThumbnail(outcome) });
+  if (budgetMs < THUMBNAIL_MIN_PHASE_MS) return knownOr('timeout');
+  if (!thumbnailJobs.acquire(client)) return knownOr('busy');
+
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), budgetMs);
   const job = {
     sharp,
-    signal,
-    fetch(url) {
-      if (!fetches.has(url)) {
-        const maxBytes = (url === imageUrl ? THUMBNAIL_KINDS.image : THUMBNAIL_KINDS.favicon).maxBytes;
-        fetches.set(url, fetchImageBytes(url, maxBytes, signal));
-      }
-      return fetches.get(url);
-    }
+    client,
+    imageUrl,
+    signal: controller.signal,
+    expired: new Promise(resolve => {
+      controller.signal.addEventListener('abort', () => resolve({ thumbnail: null, outcome: 'timeout' }), { once: true });
+    }),
+    started: [] // the work this request set going, which may outlast it
   };
-
-  const work = [
-    settleThumbnail('image', imageCandidates, job),
-    settleThumbnail('favicon', faviconCandidates, job)
-  ].map(task => task.catch(() => noThumbnail('error')));
-  // A decode can't be interrupted, so the answer may go out at the deadline
-  // while one is still finishing. The job's place is held until it really
-  // has.
-  Promise.all(work).then(() => {
-    clearTimeout(deadline);
-    thumbnailJobs.release(client);
-  });
-  const [image, favicon] = await Promise.all(work.map(task => Promise.race([task, expired])));
+  const tasks = [
+    known.image || settleThumbnail('image', imageCandidates, job),
+    known.favicon || settleThumbnail('favicon', faviconCandidates, job)
+  ].map(task => Promise.resolve(task).catch(() => noThumbnail('error')));
+  const [image, favicon] = await Promise.all(tasks);
+  clearTimeout(deadline);
+  // The request's place is given back only once the work it started has
+  // really ended, so the places bound the fetches and decodes in flight even
+  // when answers go out at a deadline.
+  Promise.all(job.started).then(() => thumbnailJobs.release(client));
   return { image, favicon };
+};
+
+// A failed page fetch that might go differently next time: a timeout, a
+// network error, or a status that says "later". A refused host, a 404 or a
+// response that isn't HTML will be the same again.
+const isTransientPageFailure = error => {
+  if (isPrivateAddressError(error) || error?.code === 'ENOTHTML') return false;
+  const status = error?.response?.status;
+  if (status) return status >= 500 || status === 429 || status === 408;
+  return true;
 };
 
 // The thumbnail fields of a response, and their part of the log line.
 // thumbnailsStatus tells a client how far to trust a null:
 //   complete     every answer is settled; safe to keep
-//   transient    something timed out or failed in passing (or the page
-//                itself couldn't be fetched); worth asking again
-//   busy         too many thumbnail requests in flight; nothing was tried
+//   transient    something timed out or failed in passing; worth asking again
+//   busy         too many thumbnail requests in flight; only what was
+//                already cached is given
 //   unavailable  this bridge can't make thumbnails at all
-const thumbnailFields = async (page, client) => {
+const thumbnailFields = async (page, pageError, client, requestStartedAt) => {
   const sharp = thumbnailEngine.get();
+  let source = page;
+  if (!source && pageError?.code === 'ENOTHTML' && pageError.finalUrl) {
+    // A PDF or a bare image has no head to read, but its site has an icon.
+    source = { preview: null, iconCandidates: [], finalUrl: pageError.finalUrl };
+  }
   let image;
   let favicon;
   let status;
   if (!sharp) {
     image = favicon = noThumbnail('unavailable');
     status = 'unavailable';
-  } else if (!page) {
-    // A page that couldn't be fetched gets no thumbnails: there is no
-    // origin to ask for an icon that hasn't just failed or been refused.
+  } else if (!source) {
+    // Nothing more is fetched for a page that failed or was refused.
     image = favicon = noThumbnail('no_page');
-    status = 'transient';
+    status = isTransientPageFailure(pageError) ? 'transient' : 'complete';
   } else {
-    ({ image, favicon } = await buildThumbnails(page, sharp, client));
-    if (image.outcome === 'busy') status = 'busy';
+    const remaining = thumbnailTuning.totalTimeoutMs - (Date.now() - requestStartedAt);
+    ({ image, favicon } = await buildThumbnails(source, sharp, client, Math.min(THUMBNAIL_PHASE_TIMEOUT_MS, remaining)));
+    if (image.outcome === 'busy' || favicon.outcome === 'busy') status = 'busy';
     else status = image.transient || favicon.transient ? 'transient' : 'complete';
   }
   const logPart = (name, result) => ` ${name}=${result.outcome}`
@@ -1562,13 +1728,17 @@ const pagePreviewRateLimiter = rateLimit({
 // Fetch a page for /preview and work out the response and the log line's
 // fields. With a thumbnailClient (the caller's IP), thumbnails are added.
 const previewAnswer = async (targetUrl, thumbnailClient) => {
+  const requestStartedAt = Date.now();
+  const wantThumbnails = thumbnailClient !== null;
   let page = null;
+  let pageError = null;
   let previewResult;
   try {
-    const fetched = await timed(fetchPreviewPage(targetUrl));
+    const fetched = await timed(fetchPreviewPage(targetUrl, { icons: wantThumbnails }));
     page = fetched.value;
     previewResult = { status: 'fulfilled', value: { value: page.preview, ms: fetched.ms } };
   } catch (reason) {
+    pageError = reason;
     previewResult = { status: 'rejected', reason };
   }
   const { preview, previewStatus, previewError, previewErrorDetail, previewMs } = summarisePreview(previewResult);
@@ -1579,42 +1749,13 @@ const previewAnswer = async (targetUrl, thumbnailClient) => {
   }
   let log = `outcome=${previewOutcome({ preview, previewError })} previewMs=${previewMs}` + (previewError ? ` previewError=${previewErrorDetail}` : '');
 
-  if (thumbnailClient !== null) {
-    const fields = await thumbnailFields(page, thumbnailClient);
+  if (wantThumbnails) {
+    const fields = await thumbnailFields(page, pageError, thumbnailClient, requestStartedAt);
     payload.thumbnails = fields.thumbnails;
     payload.thumbnailsStatus = fields.thumbnailsStatus;
     log += fields.log;
   }
   return { payload, log };
-};
-
-// Thumbnail requests for the same page that overlap share one answer: one
-// page fetch, one set of image fetches, one place among the jobs. Keyed on
-// the URL as parsed, less its fragment, which is never sent to the page's
-// server.
-const thumbnailAnswersInFlight = new Map();
-const sharedThumbnailAnswer = async (targetUrl, client) => {
-  const key = new URL(targetUrl);
-  key.hash = '';
-  const leader = thumbnailAnswersInFlight.get(key.toString());
-  if (leader) {
-    // If the shared attempt throws, so does this, and each request answers
-    // with its own 500.
-    const answer = await leader.promise;
-    // "Busy" was said to the caller that asked first; another caller has
-    // places of its own, so it makes its own attempt.
-    if (answer.payload.thumbnailsStatus === 'busy' && leader.client !== client) {
-      return previewAnswer(targetUrl, client);
-    }
-    return { payload: answer.payload, log: `${answer.log} shared=1` };
-  }
-  const promise = previewAnswer(targetUrl, client);
-  thumbnailAnswersInFlight.set(key.toString(), { promise, client });
-  try {
-    return await promise;
-  } finally {
-    thumbnailAnswersInFlight.delete(key.toString());
-  }
 };
 
 // Health check endpoint
@@ -1642,9 +1783,7 @@ app.get('/preview', limiter, pagePreviewRateLimiter, async (req, res) => {
 
     // thumbnails=1 adds small data: URI copies of the page's image and icon.
     // Any other value, or none, leaves the response exactly as it was.
-    const answer = req.query.thumbnails === '1'
-      ? await sharedThumbnailAnswer(normalizedUrl, req.ip || 'unknown')
-      : await previewAnswer(normalizedUrl, null);
+    const answer = await previewAnswer(normalizedUrl, req.query.thumbnails === '1' ? (req.ip || 'unknown') : null);
 
     console.info(`[preview] route=preview user=${authContext.identity} host=${normalizedUrl.hostname} ${answer.log}`);
 
@@ -1868,11 +2007,14 @@ module.exports.thumbnailing = {
   jobs: thumbnailJobs,
   engine: thumbnailEngine,
   tuning: thumbnailTuning,
-  inFlight: thumbnailAnswersInFlight,
+  inFlight: thumbnailsInFlight,
+  fetchesInFlight: imageFetchesInFlight,
+  decodeGate: thumbnailDecodeGate,
   sniffImageFormat,
   pickIcoImages,
   settings: Object.freeze({
     phaseTimeoutMs: THUMBNAIL_PHASE_TIMEOUT_MS,
+    minPhaseMs: THUMBNAIL_MIN_PHASE_MS,
     maxJobs: THUMBNAIL_MAX_JOBS,
     maxJobsPerClient: THUMBNAIL_MAX_JOBS_PER_CLIENT,
     maxDecodes: THUMBNAIL_MAX_DECODES,

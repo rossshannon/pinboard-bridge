@@ -92,6 +92,37 @@ test('closes the connection after a page that ends on its own', async () => {
   }
 });
 
+test('fetches through its own no-keep-alive agent, and still resolves names through the DNS guard', async () => {
+  let seen;
+  routes['/agent'] = (req, res) => {
+    seen = req.headers;
+    html(res);
+    res.end('<html><head><title>Agent</title></head></html>');
+  };
+  const lookups = [];
+  const swapped = dns.lookup;
+  dns.lookup = (hostname, ...rest) => {
+    lookups.push(hostname);
+    return swapped(hostname, ...rest);
+  };
+  try {
+    const preview = await fetchPreview(new URL(`${base}/agent`));
+    assert.equal(preview.title, 'Agent');
+    // The agent, not a header of ours, asks for the connection to be closed.
+    assert.equal(seen.connection, 'close');
+    // The name was resolved by guardedLookup (which calls dns.lookup), not by
+    // the agent on its own...
+    assert.deepEqual(lookups, ['preview.test']);
+    // ...so a name that resolves to a private address is still refused,
+    // before any connection is made.
+    await assert.rejects(fetchPreview(new URL(`http://private.test:${target.address().port}/agent`)), /not reachable from the proxy/);
+    assert.deepEqual(lookups, ['preview.test', 'private.test']);
+  } finally {
+    dns.lookup = swapped;
+  }
+  assert.ok(await allClosed(), 'expected the bridge to close the connection');
+});
+
 test('closes the connection on a non-HTML response it never reads', async () => {
   routes['/file.pdf'] = (req, res) => {
     res.writeHead(200, { 'content-type': 'application/pdf' });
