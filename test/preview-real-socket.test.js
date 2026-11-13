@@ -73,6 +73,25 @@ test('reads the head, then hangs up on a body that never ends', async () => {
   assert.ok(await allClosed(), 'expected the bridge to close the connection');
 });
 
+test('closes the connection after a page that ends on its own', async () => {
+  // A complete response would otherwise go back to the keep-alive pool, out
+  // of reach of the request's teardown, and sit there open.
+  routes['/complete'] = (req, res) => {
+    html(res);
+    res.end('<html><head><title>Whole</title></head><body>Done</body></html>');
+  };
+  routes['/complete-late'] = (req, res) => {
+    html(res);
+    res.write('<html><head><title>Whole</title>');
+    setTimeout(() => res.end('</head></html>'), 30);
+  };
+  for (const path of ['/complete', '/complete-late']) {
+    const preview = await fetchPreview(new URL(`${base}${path}`));
+    assert.equal(preview.title, 'Whole');
+    assert.ok(await allClosed(), `expected the bridge to close the connection after ${path}`);
+  }
+});
+
 test('closes the connection on a non-HTML response it never reads', async () => {
   routes['/file.pdf'] = (req, res) => {
     res.writeHead(200, { 'content-type': 'application/pdf' });

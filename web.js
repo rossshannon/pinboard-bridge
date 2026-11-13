@@ -567,10 +567,24 @@ const guardedGet = async (url, config) => {
   }
   return axios.get(target.toString(), {
     ...config,
+    // One request per connection. A response that has ended by the time we
+    // are done with it would otherwise be handed back to the keep-alive pool,
+    // where destroying the request no longer reaches it, leaving an idle
+    // socket open to a host somebody else chose.
+    headers: { ...config.headers, Connection: 'close' },
     maxRedirects: 3,
     lookup: guardedLookup,
     beforeRedirect: guardRedirect
   });
+};
+
+// Hang up on a guarded fetch, read or not. Destroying axios's stream wrapper
+// alone leaves the socket open, so the request and its socket go too.
+const tearDownResponse = response => {
+  response?.request?.destroy?.();
+  response?.data?.destroy?.();
+  response?.request?.socket?.destroy?.();
+  response?.request?.res?.socket?.destroy?.();
 };
 
 // Resolve a page-supplied link, keeping only http(s): a javascript: or data:
@@ -853,10 +867,7 @@ const fetchPreviewPage = async targetUrl => {
     throw error;
   } finally {
     clearTimeout(deadline);
-    // Destroying axios's stream wrapper before it is read leaves the socket
-    // open, so tear down the request itself once we're done with the page.
-    response?.request?.destroy?.();
-    response?.data?.destroy?.();
+    tearDownResponse(response);
   }
 };
 
@@ -910,9 +921,6 @@ const thumbnailRequestConfig = {
   responseType: 'stream',
   headers: {
     Accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif,image/x-icon;q=0.9,*/*;q=0.5',
-    // One request per connection, so no socket to a host a page chose is
-    // left idling in the keep-alive pool once its image has been read.
-    Connection: 'close',
     'User-Agent': USER_AGENT
   },
   validateStatus: status => status >= 200 && status < 300,
@@ -983,9 +991,7 @@ const fetchImageBytes = async (url, maxBytes, signal) => {
     response = response || error.response;
     throw error;
   } finally {
-    // As in fetchPreviewPage: tear the request down, read or not.
-    response?.request?.destroy?.();
-    response?.data?.destroy?.();
+    tearDownResponse(response);
   }
 };
 
