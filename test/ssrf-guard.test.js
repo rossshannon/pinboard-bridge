@@ -32,6 +32,8 @@ test('bracketed IPv6 hosts from URL parsing are checked', () => {
 
 test('a redirect to a private host is stopped', () => {
   assert.throws(() => guardRedirect({ hostname: '169.254.169.254' }), /not reachable/);
+  // Callers tell this refusal apart by its code, not its wording.
+  assert.throws(() => guardRedirect({ hostname: '10.0.0.1' }), { code: 'EPRIVATEADDRESS' });
   assert.doesNotThrow(() => guardRedirect({ hostname: 'example.com' }));
 });
 
