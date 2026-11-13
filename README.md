@@ -15,6 +15,7 @@ A CORS-enabled proxy service for the Pinboard API with enhanced security feature
 - **Graceful Shutdown**: Proper handling of SIGTERM/SIGINT signals
 - **Error Handling**: Comprehensive error handling with consistent JSON responses
 - **Preview API**: Server-side endpoint that scrapes Twitter/Open Graph metadata alongside Pinboard suggestions
+- **Preview Thumbnails**: `/preview?thumbnails=1` also returns the page's image and icon as small `data:` URIs, for clients that can't load remote images
 
 ## Requirements
 
@@ -106,7 +107,7 @@ curl \
 |--------|------|-------------|
 | `GET` | `/health` | Returns service status, uptime, and timestamp. Useful for uptime monitors. |
 | `GET` | `/v1/*` | Forwards requests to `https://api.pinboard.in` with the same path/query, after injecting auth info and normalizing responses. |
-| `GET` | `/preview` | Fetches preview metadata (Twitter Card/Open Graph) for the supplied URL. Makes no Pinboard call. |
+| `GET` | `/preview` | Fetches preview metadata (Twitter Card/Open Graph) for the supplied URL. Makes no Pinboard call. With `thumbnails=1`, also returns the page's image and icon as small `data:` URIs. |
 | `GET` | `/posts/suggest-with-preview` | Calls Pinboard’s `posts/suggest` and, in parallel, fetches preview metadata for the supplied URL. Answers once both are done; kept for older clients. |
 
 Responses default to JSON. If Pinboard returns XML (the default), the bridge converts it to JSON via `fast-xml-parser` before sending the response back to the browser.
@@ -116,6 +117,36 @@ Responses default to JSON. If Pinboard returns XML (the default), the bridge con
 Returns the `preview`, `previewStatus` and `previewError` fields described below, without the Pinboard suggestions. It takes the same `url` parameter and `Authorization` header as `/posts/suggest-with-preview`. Pinboard's `posts/suggest` can take 15 seconds or more for a URL it hasn't seen before, so clients that show a preview should call this and `/v1/posts/suggest` separately rather than wait on the combined route.
 
 The bridge reads the page only as far as `</head>` (or 512 KB), and gives up on the whole fetch, redirects included, after 5 seconds.
+
+#### Thumbnails (`thumbnails=1`)
+
+Some clients can only show images given to them as `data:` URIs (a sandboxed card whose content security policy allows nothing else, for example). Adding `thumbnails=1` to a `/preview` request adds a `thumbnails` field beside the usual ones:
+
+```json
+{
+  "preview": { "title": "Amazing Gadget", "imageUrl": "https://example.com/images/gadget.png", "…": "…" },
+  "previewStatus": "fresh",
+  "thumbnails": {
+    "image": { "dataUri": "data:image/webp;base64,…", "width": 240, "height": 126 },
+    "favicon": { "dataUri": "data:image/png;base64,…", "width": 32, "height": 32 }
+  }
+}
+```
+
+- `image` is made from `preview.imageUrl`: scaled to fit inside 240×240 and encoded as WebP. `favicon` is made from the icon the page declares, or from `/favicon.ico` on the origin the page was finally served from when the page declares none or its icon can't be used; it is scaled to fit inside 32×32 and encoded as PNG. Neither is ever enlarged, so `width` and `height` can be smaller than those limits. Animated images give a single still frame.
+- Either is `null` when there is nothing to show or it couldn't be made. A thumbnail that fails never fails the request or changes `preview` and `previewStatus`. A page with no preview data (`"preview": null`, `"previewStatus": "no_data"`) can still have a `favicon`. If the page itself couldn't be fetched, both are `null` and nothing further is requested.
+- Any other value of `thumbnails`, or none, leaves the response exactly as it was.
+
+Limits, since every image URL is chosen by the page being previewed:
+
+- Images are fetched under the same rules as the page: `http`/`https` only, never a private or loopback host (by name, by DNS or by redirect), at most three redirects.
+- An image body is read up to 2 MB and an icon up to 512 KB (after any decompression); a larger one is dropped as soon as it passes the limit.
+- Only PNG, JPEG, GIF, WebP and AVIF are decoded, plus `.ico` files for icons, judged by their first bytes rather than by `Content-Type`. SVG is never accepted. Images over 16 megapixels (icons: 4) are refused.
+- What comes back is always the bridge's own re-encoding, with the original's metadata (EXIF, colour profiles and so on) dropped.
+- Both thumbnails are fetched in parallel and share one 4-second deadline after the page fetch, so a thumbnail request takes at most about 9 seconds.
+- At most four requests build thumbnails at once. A request arriving beyond that is answered straight away with `null` thumbnails rather than queued; ask again shortly.
+- Thumbnail responses are kept in memory, per dyno, for up to 6 hours (up to 500 pages and 16 MB, least recently used dropped first), keyed on the page URL without its fragment, so a repeat request is answered without fetching anything. An answer that might improve (the page or an image timed out, hit a network error or returned a 5xx) is kept for only 5 minutes. The cached answer includes `preview`, so its `fetchedAt` shows how old it is. Requests without `thumbnails=1` never use the cache, and every response still carries `Cache-Control: no-store`.
+- The `[preview]` log line gains `cache=hit`, or `cache=miss` with an outcome and time for each thumbnail (`image=ok imageMs=41 favicon=ok faviconSource=fallback faviconMs=12`). Outcomes other than `ok` are `none` (nothing to fetch), `blocked`, `too_large`, `unsupported`, `undecodable`, `timeout`, `http_404` and the like, `error`, `busy` and `no_page`.
 
 ### `/posts/suggest-with-preview`
 
@@ -202,12 +233,19 @@ Any Node.js host that exposes port 1337 (or a configured alternative) works. Rem
 - CORS origin validation with explicit 403 JSON responses for disallowed origins
 - Rate limiting per IP (300 per 15 minutes on `/v1/*`)
 - Per-token preview throttling and structured preview logging
+- Preview thumbnails fetched under the same SSRF guard as pages, size- and time-capped, limited to sniffed raster formats (no SVG) and always re-encoded
 - 25-second budget for each Pinboard call, queueing included
 - Sanitized error messages without leaking upstream responses
 - Authorization headers only (tokens never logged in URLs)
 - `Cache-Control: no-store` on every response, no ETags, so account data never lands in a browser cache
 
 ## Changelog
+
+### Version 2.4.0
+- Add `thumbnails=1` to `/preview`: the page's image (WebP, within 240×240) and icon (PNG, within 32×32) as `data:` URIs, with `/favicon.ico` as the fallback icon
+- Fetch those images under the page fetcher's SSRF guard, with byte caps (2 MB and 512 KB), one 4-second deadline, a limit of four requests building thumbnails at once and an in-memory cache
+- Decode only PNG, JPEG, GIF, WebP, AVIF and `.ico`, recognised by their first bytes; every other libvips loader, SVG included, is switched off
+- Add `sharp` 0.35 for decoding and re-encoding
 
 ### Version 2.3.0
 - Add `/preview`, which returns page metadata without waiting on Pinboard's `posts/suggest`

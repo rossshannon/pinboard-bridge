@@ -10,6 +10,7 @@ const cors = require('cors');
 const compression = require('compression');
 const net = require('net');
 const rateLimit = require('express-rate-limit');
+const sharp = require('sharp');
 
 // Environment variable validation
 const PORT = process.env.PORT || 1337;
@@ -549,6 +550,29 @@ const guardRedirect = options => {
   }
 };
 
+// The one way the bridge fetches a URL somebody else chose (a page to
+// preview, or an image that page names): http(s) only, never a private host,
+// whether named outright, reached through DNS or reached by redirect.
+const guardedGet = async (url, config) => {
+  let target;
+  try {
+    target = new URL(url);
+  } catch (err) {
+    target = null;
+  }
+  if (!target || !['http:', 'https:'].includes(target.protocol) || isPrivateHostname(target.hostname)) {
+    const blocked = new Error('URL host is not reachable from the proxy');
+    blocked.code = 'EPRIVATEADDRESS';
+    throw blocked;
+  }
+  return axios.get(target.toString(), {
+    ...config,
+    maxRedirects: 3,
+    lookup: guardedLookup,
+    beforeRedirect: guardRedirect
+  });
+};
+
 // Resolve a page-supplied link, keeping only http(s): a javascript: or data:
 // URL must never reach a client that renders it as a link or image.
 const resolveAbsoluteUrl = (baseUrl, value) => {
@@ -624,7 +648,10 @@ const selectFavicon = ($) => {
   return null;
 };
 
-const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
+// Returns the preview (null when the page has no title, description or
+// image) together with the icon the page declares, which a thumbnail can use
+// even when there is no preview.
+const extractPageMetadata = (html, finalUrl, originalUrl) => {
   const $ = cheerio.load(html);
 
   const title = pickMetaValue($, 'meta[name="twitter:title"]')
@@ -678,10 +705,10 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
   const faviconUrl = resolveAbsoluteUrl(pageUrl, rawFavicon);
 
   if (!title && !description && !imageUrl) {
-    return null;
+    return { preview: null, faviconUrl: faviconUrl || null };
   }
 
-  return {
+  const preview = {
     url: canonicalUrl,
     title: title || null,
     description: description || null,
@@ -696,6 +723,7 @@ const extractPreviewMetadata = (html, finalUrl, originalUrl) => {
     fetchedAt: new Date().toISOString(),
     status: 'fresh'
   };
+  return { preview, faviconUrl: preview.faviconUrl };
 };
 
 // Finds where a page's head ends: </head> (not </header>), or the start of
@@ -791,17 +819,17 @@ const readHead = async data => {
   });
 };
 
-const fetchPreview = async targetUrl => {
+// Fetch a page and read its head. Resolves to the preview, the URL the page
+// was finally served from and the icon it declares.
+const fetchPreviewPage = async targetUrl => {
   // One deadline for the whole fetch (redirects and body included), not just
   // for each socket going quiet.
   const controller = new AbortController();
   const deadline = setTimeout(() => controller.abort(), PREVIEW_TIMEOUT_MS);
   let response;
   try {
-    response = await axios.get(targetUrl.toString(), {
+    response = await guardedGet(targetUrl.toString(), {
       ...previewRequestConfig,
-      lookup: guardedLookup,
-      beforeRedirect: guardRedirect,
       signal: controller.signal
     });
     const finalUrl = response.request?.res?.responseUrl || targetUrl.toString();
@@ -811,7 +839,7 @@ const fetchPreview = async targetUrl => {
     }
 
     const body = await readHead(response.data);
-    return extractPreviewMetadata(body, finalUrl, targetUrl.toString());
+    return { ...extractPageMetadata(body, finalUrl, targetUrl.toString()), finalUrl };
   } catch (error) {
     // A 4xx/5xx rejects with the unread response attached; it needs tearing
     // down just the same.
@@ -830,6 +858,420 @@ const fetchPreview = async targetUrl => {
     response?.request?.destroy?.();
     response?.data?.destroy?.();
   }
+};
+
+const fetchPreview = async targetUrl => (await fetchPreviewPage(targetUrl)).preview;
+
+// ---- Thumbnails for /preview?thumbnails=1 ----
+//
+// Small copies of a page's preview image and icon, returned as data: URIs for
+// clients that can't load remote images. Everything fetched here is named by
+// the page, so it is treated as hostile: the fetch goes through guardedGet,
+// the body is capped, only a short list of formats is decoded, and what goes
+// back is always our own re-encoding, never the origin's bytes.
+const THUMBNAIL_PHASE_TIMEOUT_MS = 4000; // image and icon together, after the page fetch
+const THUMBNAIL_DECODE_TIMEOUT_SECONDS = 3;
+// Requests building thumbnails at once; one over this gets null thumbnails
+// rather than waiting.
+const THUMBNAIL_MAX_JOBS = 4;
+// Decodes running at once. A hostile image can need its whole pixel area in
+// memory, so this and the pixel limits below bound what a Basic dyno can be
+// made to hold.
+const THUMBNAIL_MAX_DECODES = 2;
+const THUMBNAIL_KINDS = {
+  image: { maxBytes: 2 * 1024 * 1024, maxPixels: 16 * 1000 * 1000, size: 240, mime: 'image/webp' },
+  favicon: { maxBytes: 512 * 1024, maxPixels: 4 * 1000 * 1000, size: 32, mime: 'image/png' }
+};
+const THUMBNAIL_CACHE_MAX_ENTRIES = 500;
+const THUMBNAIL_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+const THUMBNAIL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+// For answers that might be better next time: the page or an image timed
+// out, the network failed, or the bridge was too busy.
+const THUMBNAIL_CACHE_RETRY_TTL_MS = 5 * 60 * 1000;
+
+// One thread per decode and no libvips cache: thumbnails are a sideline on a
+// small dyno. Every loader is switched off except the formats sniffed for
+// below, so libvips can never be talked into opening SVG, PDF, TIFF or
+// anything else, whatever the bytes look like.
+sharp.concurrency(1);
+sharp.cache(false);
+sharp.block({ operation: ['VipsForeignLoad'] });
+sharp.unblock({
+  operation: [
+    'VipsForeignLoadPngBuffer',
+    'VipsForeignLoadJpegBuffer',
+    'VipsForeignLoadNsgifBuffer',
+    'VipsForeignLoadWebpBuffer',
+    'VipsForeignLoadHeifBuffer'
+  ]
+});
+
+const thumbnailRequestConfig = {
+  responseType: 'stream',
+  headers: {
+    Accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif,image/x-icon;q=0.9,*/*;q=0.5',
+    // One request per connection, so no socket to a host a page chose is
+    // left idling in the keep-alive pool once its image has been read.
+    Connection: 'close',
+    'User-Agent': USER_AGENT
+  },
+  validateStatus: status => status >= 200 && status < 300,
+};
+
+// A thumbnail that can't be made. `outcome` is a short word for the logs.
+const thumbnailError = outcome => {
+  const error = new Error(`Thumbnail failed: ${outcome}`);
+  error.outcome = outcome;
+  return error;
+};
+
+const thumbnailOutcome = (error, signal) => {
+  if (error?.outcome) return error.outcome;
+  if (signal.aborted) return 'timeout';
+  if (error?.code === 'EPRIVATEADDRESS' || error?.cause?.code === 'EPRIVATEADDRESS'
+    || /not reachable from the proxy/i.test(error?.message || '')) {
+    return 'blocked';
+  }
+  if (error?.response?.status) return `http_${error.response.status}`;
+  return 'error';
+};
+
+// Outcomes worth another try before long, as opposed to a settled answer
+// such as a 404 or a file that isn't an image.
+const isTransientOutcome = outcome =>
+  ['timeout', 'error', 'busy', 'http_408', 'http_429'].includes(outcome) || /^http_5/.test(outcome);
+
+// Read a response body into memory, giving up the moment it passes maxBytes
+// or the signal fires.
+const readCapped = (stream, maxBytes, signal) => new Promise((resolve, reject) => {
+  const chunks = [];
+  let length = 0;
+  let settled = false;
+  const settle = (fn, value) => {
+    if (settled) return;
+    settled = true;
+    signal.removeEventListener('abort', onAbort);
+    fn(value);
+  };
+  const fail = error => {
+    stream.destroy();
+    settle(reject, error);
+  };
+  const onAbort = () => fail(thumbnailError('timeout'));
+  if (signal.aborted) return onAbort();
+  signal.addEventListener('abort', onAbort);
+  stream.on('data', chunk => {
+    length += chunk.length;
+    if (length > maxBytes) return fail(thumbnailError('too_large'));
+    chunks.push(chunk);
+  });
+  stream.on('end', () => settle(resolve, Buffer.concat(chunks)));
+  stream.on('error', error => settle(reject, error));
+  stream.on('close', () => settle(reject, thumbnailError('error')));
+});
+
+// Fetch an image the page named, through the same guards as the page itself.
+const fetchImageBytes = async (url, maxBytes, signal) => {
+  let response;
+  try {
+    response = await guardedGet(url, { ...thumbnailRequestConfig, signal });
+    if (Number(response.headers['content-length']) > maxBytes) {
+      throw thumbnailError('too_large');
+    }
+    return await readCapped(response.data, maxBytes, signal);
+  } catch (error) {
+    response = response || error.response;
+    throw error;
+  } finally {
+    // As in fetchPreviewPage: tear the request down, read or not.
+    response?.request?.destroy?.();
+    response?.data?.destroy?.();
+  }
+};
+
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const startsWith = (buffer, bytes, offset = 0) =>
+  buffer.length >= offset + bytes.length && buffer.compare(bytes, 0, bytes.length, offset, offset + bytes.length) === 0;
+
+// Decide what a file is from its first bytes; the Content-Type header and the
+// URL's extension are the origin's say-so and count for nothing. Anything not
+// listed (SVG and HTML included) is null.
+const sniffImageFormat = buffer => {
+  if (startsWith(buffer, PNG_MAGIC)) return 'png';
+  if (startsWith(buffer, Buffer.from([0xff, 0xd8, 0xff]))) return 'jpeg';
+  if (startsWith(buffer, Buffer.from('GIF87a')) || startsWith(buffer, Buffer.from('GIF89a'))) return 'gif';
+  if (startsWith(buffer, Buffer.from('RIFF')) && startsWith(buffer, Buffer.from('WEBP'), 8)) return 'webp';
+  if (startsWith(buffer, Buffer.from('ftyp'), 4)) {
+    // An ISO media file: AVIF if its major or a compatible brand says so.
+    const boxEnd = Math.min(buffer.readUInt32BE(0), buffer.length, 64);
+    for (let at = 8; at + 4 <= boxEnd; at += 4) {
+      if (at === 12) continue; // the minor version, not a brand
+      const brand = buffer.toString('latin1', at, at + 4);
+      if (brand === 'avif' || brand === 'avis') return 'avif';
+    }
+    return null;
+  }
+  if (startsWith(buffer, Buffer.from([0, 0, 1, 0]))) return 'ico';
+  return null;
+};
+// What sharp calls each format once it has opened it.
+const SHARP_FORMAT_NAMES = { png: 'png', jpeg: 'jpeg', gif: 'gif', webp: 'webp', avif: 'heif' };
+
+const ICO_MAX_ENTRIES = 64;
+const ICO_MAX_DIMENSION = 256;
+
+// Decode one ICO entry stored as a bitmap: an uncompressed 24- or 32-bit DIB
+// followed by a 1-bit transparency mask. Returns raw RGBA, or null for
+// anything else (palettes, compression, sizes that don't fit the data).
+const decodeIcoBitmap = data => {
+  if (data.length < 40) return null;
+  const headerSize = data.readUInt32LE(0);
+  const width = data.readInt32LE(4);
+  const height = data.readInt32LE(8) / 2; // stored doubled, to cover the mask
+  const bitCount = data.readUInt16LE(14);
+  const compression = data.readUInt32LE(16);
+  if (headerSize < 40 || headerSize > data.length) return null;
+  if (compression !== 0 || (bitCount !== 24 && bitCount !== 32)) return null;
+  if (!Number.isInteger(height) || width < 1 || height < 1 || width > ICO_MAX_DIMENSION || height > ICO_MAX_DIMENSION) {
+    return null;
+  }
+  const bytesPerPixel = bitCount / 8;
+  const stride = Math.ceil((width * bitCount) / 32) * 4;
+  const maskAt = headerSize + stride * height;
+  if (maskAt > data.length) return null;
+  const maskStride = Math.ceil(width / 32) * 4;
+  const hasMask = maskAt + maskStride * height <= data.length;
+
+  const rgba = Buffer.alloc(width * height * 4);
+  let anyAlpha = false;
+  for (let y = 0; y < height; y += 1) {
+    const row = headerSize + (height - 1 - y) * stride; // rows are stored bottom-up
+    for (let x = 0; x < width; x += 1) {
+      const from = row + x * bytesPerPixel;
+      const to = (y * width + x) * 4;
+      rgba[to] = data[from + 2];
+      rgba[to + 1] = data[from + 1];
+      rgba[to + 2] = data[from];
+      rgba[to + 3] = bitCount === 32 ? data[from + 3] : 255;
+      if (bitCount === 32 && data[from + 3] !== 0) anyAlpha = true;
+    }
+  }
+  // 24-bit entries, and 32-bit ones whose alpha channel was left empty, take
+  // their transparency from the mask (a set bit is transparent).
+  if (bitCount === 24 || !anyAlpha) {
+    for (let y = 0; y < height; y += 1) {
+      const row = maskAt + (height - 1 - y) * maskStride;
+      for (let x = 0; x < width; x += 1) {
+        const masked = hasMask && (data[row + (x >> 3)] & (0x80 >> (x & 7))) !== 0;
+        rgba[(y * width + x) * 4 + 3] = masked ? 0 : 255;
+      }
+    }
+  }
+  return { rgba, width, height };
+};
+
+// Pick the entry of an .ico file best suited to targetSize: the smallest one
+// at least that big, else the biggest. Returns { png } for an embedded PNG
+// (still to be decoded), { raw } for a decoded bitmap, or null. Every offset
+// and size in the file is checked against the buffer before it is used.
+const pickIcoImage = (buffer, targetSize) => {
+  if (buffer.length < 6 || buffer.readUInt16LE(0) !== 0 || buffer.readUInt16LE(2) !== 1) return null;
+  const count = buffer.readUInt16LE(4);
+  const directoryEnd = 6 + 16 * count;
+  if (count < 1 || count > ICO_MAX_ENTRIES || directoryEnd > buffer.length) return null;
+
+  const entries = [];
+  for (let i = 0; i < count; i += 1) {
+    const at = 6 + 16 * i;
+    const size = buffer.readUInt32LE(at + 8);
+    const offset = buffer.readUInt32LE(at + 12);
+    if (size < 1 || offset < directoryEnd || offset + size > buffer.length) continue;
+    entries.push({
+      extent: Math.min(buffer[at] || 256, buffer[at + 1] || 256), // 0 means 256
+      bitCount: buffer.readUInt16LE(at + 6),
+      data: buffer.subarray(offset, offset + size)
+    });
+  }
+  const rank = entry => (entry.extent >= targetSize ? entry.extent : 2 * ICO_MAX_DIMENSION - entry.extent);
+  entries.sort((a, b) => rank(a) - rank(b) || b.bitCount - a.bitCount);
+
+  for (const entry of entries) {
+    if (startsWith(entry.data, PNG_MAGIC)) return { png: entry.data };
+    const raw = decodeIcoBitmap(entry.data);
+    if (raw) return { raw };
+  }
+  return null;
+};
+
+// At most `max` calls run at once; the rest wait their turn.
+const createGate = max => {
+  let active = 0;
+  const waiting = [];
+  return async fn => {
+    if (active >= max) {
+      await new Promise(resolve => waiting.push(resolve)); // woken holding a slot
+    } else {
+      active += 1;
+    }
+    try {
+      return await fn();
+    } finally {
+      const next = waiting.shift();
+      if (next) next(); else active -= 1;
+    }
+  };
+};
+const thumbnailDecodeGate = createGate(THUMBNAIL_MAX_DECODES);
+
+// Turn fetched bytes into a thumbnail: { dataUri, width, height }.
+const renderThumbnail = async (kind, bytes, signal) => {
+  const spec = THUMBNAIL_KINDS[kind];
+  let format = sniffImageFormat(bytes);
+  let input = bytes;
+  let raw;
+  if (format === 'ico') {
+    const picked = kind === 'favicon' ? pickIcoImage(bytes, spec.size) : null;
+    if (!picked) throw thumbnailError('unsupported');
+    if (picked.png) {
+      input = picked.png;
+      format = 'png';
+    } else {
+      input = picked.raw.rgba;
+      raw = { width: picked.raw.width, height: picked.raw.height, channels: 4 };
+      format = 'raw';
+    }
+  }
+  if (!format) throw thumbnailError('unsupported');
+
+  return thumbnailDecodeGate(async () => {
+    if (signal.aborted) throw thumbnailError('timeout');
+    // Animated files give their first frame only (pages: 1).
+    const options = { limitInputPixels: spec.maxPixels, failOn: 'error', sequentialRead: true, pages: 1, raw };
+    try {
+      if (!raw) {
+        // The loader libvips chose must be the one the first bytes promised.
+        const metadata = await sharp(input, options).metadata();
+        if (metadata.format !== SHARP_FORMAT_NAMES[format]) throw thumbnailError('unsupported');
+      }
+      // Nothing of the original's metadata is carried over: sharp drops EXIF,
+      // ICC and the rest unless asked to keep them.
+      const resized = sharp(input, options)
+        .rotate() // apply the EXIF orientation that is about to be dropped
+        .resize({ width: spec.size, height: spec.size, fit: 'inside', withoutEnlargement: true })
+        .timeout({ seconds: THUMBNAIL_DECODE_TIMEOUT_SECONDS });
+      const encoded = kind === 'image' ? resized.webp({ quality: 70 }) : resized.png();
+      const { data, info } = await encoded.toBuffer({ resolveWithObject: true });
+      return { dataUri: `data:${spec.mime};base64,${data.toString('base64')}`, width: info.width, height: info.height };
+    } catch (error) {
+      throw error.outcome ? error : thumbnailError('undecodable');
+    }
+  });
+};
+
+// Try each candidate URL in turn until one makes a thumbnail. Never rejects.
+const settleThumbnail = async (kind, candidates, signal) => {
+  const startedAt = Date.now();
+  let outcome = 'none'; // nothing to fetch
+  let transient = false;
+  for (const { source, url } of candidates) {
+    try {
+      const bytes = await fetchImageBytes(url, THUMBNAIL_KINDS[kind].maxBytes, signal);
+      const thumbnail = await renderThumbnail(kind, bytes, signal);
+      return { thumbnail, outcome: 'ok', source, transient: false, ms: Date.now() - startedAt };
+    } catch (error) {
+      outcome = thumbnailOutcome(error, signal);
+      transient = transient || isTransientOutcome(outcome);
+      if (signal.aborted) break;
+    }
+  }
+  return { thumbnail: null, outcome, source: null, transient, ms: Date.now() - startedAt };
+};
+
+const thumbnailJobs = { active: 0 };
+const noThumbnail = (outcome, ms = 0) =>
+  ({ thumbnail: null, outcome, source: null, transient: isTransientOutcome(outcome), ms });
+
+// Build both thumbnails for a fetched page, in parallel, under one deadline.
+// Resolves to { image, favicon }, each as settleThumbnail returns; never
+// rejects.
+const buildThumbnails = async page => {
+  if (thumbnailJobs.active >= THUMBNAIL_MAX_JOBS) {
+    return { image: noThumbnail('busy'), favicon: noThumbnail('busy') };
+  }
+  thumbnailJobs.active += 1;
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const deadline = setTimeout(() => controller.abort(), THUMBNAIL_PHASE_TIMEOUT_MS);
+  const expired = new Promise(resolve => {
+    signal.addEventListener('abort', () => resolve(noThumbnail('timeout', THUMBNAIL_PHASE_TIMEOUT_MS)), { once: true });
+  });
+
+  const imageCandidates = page.preview?.imageUrl ? [{ source: 'declared', url: page.preview.imageUrl }] : [];
+  // The page's own icon first, then /favicon.ico on the origin the page was
+  // finally served from.
+  const faviconCandidates = [];
+  if (page.faviconUrl) faviconCandidates.push({ source: 'declared', url: page.faviconUrl });
+  const fallbackIcon = resolveAbsoluteUrl(page.finalUrl, '/favicon.ico');
+  if (fallbackIcon && fallbackIcon !== page.faviconUrl) faviconCandidates.push({ source: 'fallback', url: fallbackIcon });
+
+  const work = [
+    settleThumbnail('image', imageCandidates, signal),
+    settleThumbnail('favicon', faviconCandidates, signal)
+  ].map(task => task.catch(() => noThumbnail('error')));
+  // A decode can't be interrupted, so the answer may go out at the deadline
+  // while one is still finishing. The job's slot is held until it really has.
+  Promise.all(work).then(() => {
+    clearTimeout(deadline);
+    thumbnailJobs.active -= 1;
+  });
+  const [image, favicon] = await Promise.all(work.map(task => Promise.race([task, expired])));
+  return { image, favicon };
+};
+
+// Finished thumbnail-mode response bodies, most recently used last. Bounded
+// by entry count and by total size; entries past their time are dropped when
+// next asked for.
+const thumbnailCache = {
+  entries: new Map(),
+  bytes: 0,
+  get(key) {
+    const entry = this.entries.get(key);
+    if (!entry) return null;
+    this.delete(key);
+    if (entry.expiresAt <= Date.now()) return null;
+    this.entries.set(key, entry);
+    this.bytes += entry.bytes;
+    return entry.body;
+  },
+  set(key, body, ttlMs) {
+    this.delete(key);
+    const bytes = Buffer.byteLength(body) + Buffer.byteLength(key);
+    if (bytes > THUMBNAIL_CACHE_MAX_BYTES) return;
+    this.entries.set(key, { body, bytes, expiresAt: Date.now() + ttlMs });
+    this.bytes += bytes;
+    for (const oldest of this.entries.keys()) {
+      if (this.entries.size <= THUMBNAIL_CACHE_MAX_ENTRIES && this.bytes <= THUMBNAIL_CACHE_MAX_BYTES) break;
+      this.delete(oldest);
+    }
+  },
+  delete(key) {
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    this.entries.delete(key);
+    this.bytes -= entry.bytes;
+  },
+  clear() {
+    this.entries.clear();
+    this.bytes = 0;
+  }
+};
+
+// The cache key for a target: the URL as parsed, less its fragment, which is
+// never sent to the page's server.
+const thumbnailCacheKey = targetUrl => {
+  const key = new URL(targetUrl);
+  key.hash = '';
+  return key.toString();
 };
 
 // Validate the ?url= target shared by the preview routes. Returns the parsed
@@ -949,9 +1391,24 @@ app.get('/preview', limiter, pagePreviewRateLimiter, async (req, res) => {
       return res.status(401).json({ error: err.message });
     }
 
+    // thumbnails=1 adds small data: URI copies of the page's image and icon.
+    // Any other value, or none, leaves the response exactly as it was.
+    const wantThumbnails = req.query.thumbnails === '1';
+    const cacheKey = wantThumbnails ? thumbnailCacheKey(normalizedUrl) : null;
+    if (wantThumbnails) {
+      const cachedBody = thumbnailCache.get(cacheKey);
+      if (cachedBody) {
+        console.info(`[preview] route=preview user=${authContext.identity} host=${normalizedUrl.hostname} cache=hit`);
+        return res.type('json').send(cachedBody);
+      }
+    }
+
+    let page = null;
     let previewResult;
     try {
-      previewResult = { status: 'fulfilled', value: await timed(fetchPreview(normalizedUrl)) };
+      const fetched = await timed(fetchPreviewPage(normalizedUrl));
+      page = fetched.value;
+      previewResult = { status: 'fulfilled', value: { value: page.preview, ms: fetched.ms } };
     } catch (reason) {
       previewResult = { status: 'rejected', reason };
     }
@@ -962,7 +1419,25 @@ app.get('/preview', limiter, pagePreviewRateLimiter, async (req, res) => {
       payload.previewError = previewError;
     }
 
-    console.info(`[preview] route=preview user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${previewOutcome({ preview, previewError })} previewMs=${previewMs}` + (previewError ? ` previewError=${previewErrorDetail}` : ''));
+    let thumbnailLog = '';
+    if (wantThumbnails) {
+      // A page that couldn't be fetched gets no thumbnails: there is no
+      // origin to ask for an icon that hasn't just failed or been refused.
+      const { image, favicon } = page
+        ? await buildThumbnails(page)
+        : { image: noThumbnail('no_page'), favicon: noThumbnail('no_page') };
+      payload.thumbnails = { image: image.thumbnail, favicon: favicon.thumbnail };
+      const body = JSON.stringify(payload);
+      const busy = image.outcome === 'busy' || favicon.outcome === 'busy';
+      if (!busy) {
+        const retrySoon = !page || image.transient || favicon.transient;
+        thumbnailCache.set(cacheKey, body, retrySoon ? THUMBNAIL_CACHE_RETRY_TTL_MS : THUMBNAIL_CACHE_TTL_MS);
+      }
+      thumbnailLog = ` cache=miss image=${image.outcome} imageMs=${image.ms} favicon=${favicon.outcome}`
+        + (favicon.source ? ` faviconSource=${favicon.source}` : '') + ` faviconMs=${favicon.ms}`;
+    }
+
+    console.info(`[preview] route=preview user=${authContext.identity} host=${normalizedUrl.hostname} outcome=${previewOutcome({ preview, previewError })} previewMs=${previewMs}` + (previewError ? ` previewError=${previewErrorDetail}` : '') + thumbnailLog);
 
     return res.json(payload);
   } catch (error) {
@@ -1177,3 +1652,20 @@ const queuedPinboardCalls = () => {
 };
 
 module.exports = { app, server, parseIntSetting, jsonErrorHandler, pinboardSettings, queuedPinboardCalls, isPrivateAddress, isPrivateHostname, guardRedirect, fetchPreview, readHead, addressGuard };
+
+// The thumbnail internals, for tests.
+module.exports.thumbnailing = {
+  cache: thumbnailCache,
+  jobs: thumbnailJobs,
+  sniffImageFormat,
+  pickIcoImage,
+  settings: Object.freeze({
+    phaseTimeoutMs: THUMBNAIL_PHASE_TIMEOUT_MS,
+    maxJobs: THUMBNAIL_MAX_JOBS,
+    cacheMaxEntries: THUMBNAIL_CACHE_MAX_ENTRIES,
+    cacheMaxBytes: THUMBNAIL_CACHE_MAX_BYTES,
+    cacheTtlMs: THUMBNAIL_CACHE_TTL_MS,
+    cacheRetryTtlMs: THUMBNAIL_CACHE_RETRY_TTL_MS,
+    kinds: THUMBNAIL_KINDS
+  })
+};
